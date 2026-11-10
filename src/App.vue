@@ -3,7 +3,7 @@ import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
 import {House,CalendarDays,UsersRound,ListTodo,BarChart3,Settings,LogOut,Bell,Plus,ChevronLeft,ChevronRight,ChevronDown,Check,CheckCircle2,Clock3,Utensils,Sun,Shirt,Droplets,Shuffle,Trash2,Pencil,Copy,X,RefreshCw,ArrowRightLeft,Menu,AlertCircle,ShieldCheck,LoaderCircle} from 'lucide-vue-next'
 import {supabase,configured,check} from './supabase.js'
 import {generateWeek,mondayOf,dateAt,isBusy,overlap,isAnytime} from './scheduler.js'
-const iconFor={lunch:Utensils,dinner:Utensils,wash:Shirt,dry:Sun,water:Droplets}
+const iconFor={lunch:Utensils,dinner:Utensils,dishes_lunch:Utensils,dishes_dinner:Utensils,wash:Shirt,dry:Sun,water:Droplets}
 const user=ref(null),booting=ref(true),roomStatus=ref('loading'),roomLoadError=ref(''),busy=ref(false),message=ref(''),error=ref(''),loginEmail=ref(''),emailSent=ref(false)
 const currentTab=ref('schedule'),modal=ref(''),menuOpen=ref(false),room=ref(null),members=ref([]),chores=ref([]),assignments=ref([]),availability=ref([]),busySlots=ref([]),debts=ref([]),swaps=ref([]),notifications=ref([]),profiles=ref([])
 const weekStart=ref(mondayOf(new Date().toISOString().slice(0,10))),selectedDay=ref(new Date().toISOString().slice(0,10))
@@ -158,7 +158,7 @@ async function copyCode(){try{await navigator.clipboard.writeText(room.value.inv
 async function removeMember(id){if(!confirm('Xóa thành viên khỏi nhóm?'))return;await run(async()=>{await check(await supabase.rpc('room_remove_member',{p_room:room.value.id,p_user:id}));await refresh();toast('Đã xóa thành viên')})}
 async function leaveRoom(){if(!confirm('Bạn muốn rời nhóm trọ?'))return;await run(async()=>{await check(await supabase.rpc('room_leave',{p_room:room.value.id}));reset();toast('Đã rời nhóm trọ')})}
 function openChore(chore=null){draft.value=chore?{...chore,weekdays:[...chore.weekdays],time_mode:chore.time_mode||(isAnytime(chore)?'anytime':'timed')}:{name:'',icon:'sparkles',time_mode:'anytime',weight:1,start_time:'09:00',duration_minutes:30,weekdays:[1,2,3,4,5,6,7],enabled:true};modal.value='chore'}
-function onChoreIconChange(){if(['lunch','dinner'].includes(draft.value.icon)){draft.value.time_mode='timed'}else if(['wash','dry','water'].includes(draft.value.icon)){draft.value.time_mode='anytime'}}
+function onChoreIconChange(){if(['lunch','dinner','dishes_lunch','dishes_dinner'].includes(draft.value.icon)){draft.value.time_mode='timed'}else if(['wash','dry','water'].includes(draft.value.icon)){draft.value.time_mode='anytime'}}
 async function saveChore(){await run(async()=>{const d=draft.value;const values={room_id:room.value.id,name:d.name?.trim(),icon:d.icon||'sparkles',weight:Number(d.weight),time_mode:d.time_mode||'anytime',start_time:d.start_time||'09:00',duration_minutes:Number(d.duration_minutes||30),weekdays:d.weekdays,enabled:Boolean(d.enabled)};if(!values.name||!values.weekdays.length)throw Error('Nhập tên việc và chọn ít nhất một ngày');if(d.id)await check(await supabase.from('chores').update(values).eq('id',d.id));else await check(await supabase.from('chores').insert(values));modal.value='';await refresh();toast('Đã lưu công việc')})}
 async function deleteChore(id){if(!confirm('Xóa công việc này và các lịch liên quan?'))return;await run(async()=>{await check(await supabase.from('chores').delete().eq('id',id));modal.value='';await refresh();toast('Đã xóa công việc')})}
 function toggleWeekday(d){draft.value.weekdays=draft.value.weekdays.includes(d)?draft.value.weekdays.filter(x=>x!==d):[...draft.value.weekdays,d].sort()}
@@ -223,8 +223,71 @@ async function scheduleMakeup(){
 async function toggleAvailability(day){await run(async()=>{const old=availability.value.find(a=>a.user_id===user.value.id&&a.weekday===day);await check(await supabase.from('member_availability').upsert({room_id:room.value.id,user_id:user.value.id,weekday:day,available:old?.available===false}));await refresh()})}
 async function saveProfile(){await run(async()=>{const value=draftName.value.trim();if(!value||value.length>60)throw Error('Tên phải từ 1 đến 60 ký tự');await check(await supabase.from('room_profiles').update({display_name:value,updated_at:new Date().toISOString()}).eq('user_id',user.value.id));modal.value='';await refresh();toast('Đã cập nhật hồ sơ')})}
 async function readNotifications(){await run(async()=>{await check(await supabase.from('room_notifications').update({read_at:new Date().toISOString()}).eq('user_id',user.value.id).is('read_at',null));await refresh()})}
-let channel=null;watch(()=>room.value?.id,id=>{if(channel){supabase.removeChannel(channel);channel=null}if(id&&supabase){channel=supabase.channel('roomly-'+id).on('postgres_changes',{event:'*',schema:'public',table:'assignments',filter:'room_id=eq.'+id},()=>refresh().catch(()=>{})).subscribe()}})
-onMounted(init);onUnmounted(()=>{authSubscription?.unsubscribe();if(channel&&supabase)supabase.removeChannel(channel)})
+// Live synchronization for all shared Roomly data. Coalesce a burst of
+// database changes (e.g. a weekly scheduling transaction) into one fetch.
+const liveState=ref('connecting')
+let channel=null,memberChannel=null,liveTimer=null,liveRequest=0,lastReconnect=0
+function closeChannel(ch){if(ch&&supabase)supabase.removeChannel(ch)}
+function queueLiveRefresh(membership=false){
+ if(!user.value)return
+ if(membership)liveRequest=1
+ if(liveTimer)clearTimeout(liveTimer)
+ liveTimer=setTimeout(async()=>{
+  liveTimer=null
+  const shouldReload=Boolean(liveRequest)
+  liveRequest=0
+  try{
+   if(shouldReload)await loadEverything()
+   else if(room.value)await refresh()
+  }catch(e){liveState.value='error';console.warn('Roomly realtime synchronization failed',e)}
+ },220)
+}
+watch(()=>room.value?.id,id=>{
+ closeChannel(channel);channel=null
+ if(!id||!supabase){liveState.value='connecting';return}
+ liveState.value='connecting'
+ const changes=['rooms','room_members','room_profiles','chores','assignments',
+  'member_availability','room_busy_slots','room_work_debts','swap_requests','room_notifications']
+ let next=supabase.channel('roomly-all-'+id)
+ for(const table of changes){
+  const rule={event:'*',schema:'public',table}
+  if(table==='rooms')rule.filter='id=eq.'+id
+  else if(table==='room_notifications')rule.filter='user_id=eq.'+user.value.id
+  else if(table!=='room_profiles')rule.filter='room_id=eq.'+id
+  next=next.on('postgres_changes',rule,()=>{
+   if(table==='rooms'||table==='room_members')queueLiveRefresh(true)
+   else queueLiveRefresh(false)
+  })
+ }
+ channel=next.subscribe(status=>{
+  if(status==='SUBSCRIBED'){liveState.value='connected';queueLiveRefresh(false)}
+  else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED')
+   liveState.value='reconnecting'
+ })
+})
+watch(()=>user.value?.id,id=>{
+ closeChannel(memberChannel);memberChannel=null
+ if(!id||!supabase)return
+ memberChannel=supabase.channel('roomly-membership-'+id)
+  .on('postgres_changes',{event:'*',schema:'public',table:'room_members',filter:'user_id=eq.'+id},
+   ()=>queueLiveRefresh(true))
+  .subscribe()
+})
+function checkReconnect(){
+ if(!user.value||document.visibilityState==='hidden')return
+ if(Date.now()-lastReconnect<2500)return
+ lastReconnect=Date.now()
+ queueLiveRefresh(true)
+}
+onMounted(()=>{init();window.addEventListener('focus',checkReconnect);window.addEventListener('online',checkReconnect);document.addEventListener('visibilitychange',checkReconnect)})
+onUnmounted(()=>{
+ authSubscription?.unsubscribe()
+ closeChannel(channel);closeChannel(memberChannel)
+ if(liveTimer)clearTimeout(liveTimer)
+ window.removeEventListener('focus',checkReconnect)
+ window.removeEventListener('online',checkReconnect)
+ document.removeEventListener('visibilitychange',checkReconnect)
+})
 </script>
 
 <template>
@@ -291,7 +354,7 @@ onMounted(init);onUnmounted(()=>{authSubscription?.unsubscribe();if(channel&&sup
    </Transition>
   </main>
   <nav class="bottom-nav" aria-label="Điều hướng chính"><button v-for="item in [{id:'schedule',icon:CalendarDays,label:'Lịch tuần'},{id:'members',icon:UsersRound,label:'Nhóm trọ'},{id:'chores',icon:ListTodo,label:'Công việc'},{id:'stats',icon:BarChart3,label:'Thống kê'}]" :key="item.id" @click="currentTab=item.id" :class="{active:currentTab===item.id}"><component :is="item.icon" :size="21"/><span>{{item.label}}</span></button></nav></div>
-  <Transition name="modal"><div v-if="modal" class="modal-backdrop" @click.self="modal=''"><div class="modal-card" role="dialog" aria-modal="true"><header><h2>{{modal==='chore'?(draft.id?'Chỉnh sửa công việc':'Thêm công việc'):modal==='swap'?'Chuyển việc / Ghi nợ':modal==='busy'?'Khai báo lịch bận':modal==='makeup'?'Phân lịch bù nợ':modal==='profile'?'Chỉnh sửa hồ sơ':modal==='manual'?'Phân công thủ công':modal==='rename'?'Đổi tên nhóm':'Lưu ý phân lịch'}}</h2><button class="icon-button" aria-label="Đóng" @click="modal=''"><X :size="20"/></button></header><template v-if="modal==='chore'"><label>Tên công việc</label><input v-model="draft.name" placeholder="Ví dụ: Lau nhà" maxlength="80"/><label>Loại công việc</label><select v-model="draft.icon" @change="onChoreIconChange"><option value="sparkles">Việc nhà khác (quét/lau nhà)</option><option value="lunch">Nấu trưa</option><option value="dinner">Nấu tối</option><option value="wash">Giặt và phơi quần áo</option><option value="water">Đổi nước</option></select><label>Thời gian thực hiện</label><select v-model="draft.time_mode"><option value="anytime">Trong ngày — không yêu cầu giờ cụ thể</option><option value="timed">Theo giờ — dành cho nấu ăn hoặc việc cố định</option></select><div v-if="draft.time_mode==='timed'" class="form-two"><div><label>Giờ thực hiện</label><input type="time" v-model="draft.start_time"/></div><div><label>Số phút</label><input type="number" v-model.number="draft.duration_minutes" min="5" max="360"/></div></div><p v-else class="busy-explainer">Công việc được giao theo ngày, có thể làm bất kỳ lúc nào trong ngày rảnh. Không cần khai báo giờ bắt đầu hoặc kết thúc.</p><label>Độ khó (điểm)</label><input type="number" v-model.number="draft.weight" min="1" max="10"/><label>Ngày lặp trong tuần</label><div class="day-options"><button v-for="(day,i) in weekdays" :key="i" type="button" :class="{selected:draft.weekdays.includes(i+1)}" @click="toggleWeekday(i+1)">{{day}}</button></div><label class="checkrow"><input type="checkbox" v-model="draft.enabled"/> Đang áp dụng</label><button class="btn btn-dark" :disabled="busy" @click="saveChore">Lưu công việc</button><button v-if="draft.id" class="btn btn-danger" @click="deleteChore(draft.id)">Xóa công việc</button></template><template v-else-if="modal==='swap'">
+  <Transition name="modal"><div v-if="modal" class="modal-backdrop" @click.self="modal=''"><div class="modal-card" role="dialog" aria-modal="true"><header><h2>{{modal==='chore'?(draft.id?'Chỉnh sửa công việc':'Thêm công việc'):modal==='swap'?'Chuyển việc / Ghi nợ':modal==='busy'?'Khai báo lịch bận':modal==='makeup'?'Phân lịch bù nợ':modal==='profile'?'Chỉnh sửa hồ sơ':modal==='manual'?'Phân công thủ công':modal==='rename'?'Đổi tên nhóm':'Lưu ý phân lịch'}}</h2><button class="icon-button" aria-label="Đóng" @click="modal=''"><X :size="20"/></button></header><template v-if="modal==='chore'"><label>Tên công việc</label><input v-model="draft.name" placeholder="Ví dụ: Lau nhà" maxlength="80"/><label>Loại công việc</label><select v-model="draft.icon" @change="onChoreIconChange"><option value="sparkles">Việc nhà khác (quét/lau nhà)</option><option value="lunch">Nấu trưa</option><option value="dinner">Nấu tối</option><option value="dishes_lunch">Rửa chén trưa</option><option value="dishes_dinner">Rửa chén tối</option><option value="wash">Giặt và phơi quần áo</option><option value="water">Đổi nước</option></select><label>Thời gian thực hiện</label><select v-model="draft.time_mode"><option value="anytime">Trong ngày — không yêu cầu giờ cụ thể</option><option value="timed">Theo giờ — dành cho nấu ăn hoặc việc cố định</option></select><div v-if="draft.time_mode==='timed'" class="form-two"><div><label>Giờ thực hiện</label><input type="time" v-model="draft.start_time"/></div><div><label>Số phút</label><input type="number" v-model.number="draft.duration_minutes" min="5" max="360"/></div></div><p v-else class="busy-explainer">Công việc được giao theo ngày, có thể làm bất kỳ lúc nào trong ngày rảnh. Không cần khai báo giờ bắt đầu hoặc kết thúc.</p><label>Độ khó (điểm)</label><input type="number" v-model.number="draft.weight" min="1" max="10"/><label>Ngày lặp trong tuần</label><div class="day-options"><button v-for="(day,i) in weekdays" :key="i" type="button" :class="{selected:draft.weekdays.includes(i+1)}" @click="toggleWeekday(i+1)">{{day}}</button></div><label class="checkrow"><input type="checkbox" v-model="draft.enabled"/> Đang áp dụng</label><button class="btn btn-dark" :disabled="busy" @click="saveChore">Lưu công việc</button><button v-if="draft.id" class="btn btn-danger" @click="deleteChore(draft.id)">Xóa công việc</button></template><template v-else-if="modal==='swap'">
  <p>Nhờ người khác nhận việc khi bạn bận đột xuất. Hệ thống tự lọc người trùng giờ học, đi làm hoặc đã có việc.</p>
  <label>Thành viên có thể nhận thay</label>
  <select v-model="newRecipient"><option value="">Chọn thành viên rảnh</option><option v-for="m in transferCandidates" :key="m.user_id" :value="m.user_id">{{nameOf(m.user_id)}}</option></select>
