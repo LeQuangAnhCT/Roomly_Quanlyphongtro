@@ -35,7 +35,7 @@ test('focusing the app is rate-limited and does not force a visible loader',()=>
 
 test('tab switching does not use out-in transition that blanks and remounts the page',()=>{
  assert.doesNotMatch(source,/<Transition name="page" mode="out-in">/)
- assert.match(source,/<template>\s*<section v-if="currentTab==='schedule'"/)
+ assert.match(source,/<main class="main-area">\s*<section v-if="currentTab==='schedule'"/)
 })
 test('focus only refreshes background data, no unconditional whole-room reload',()=>{
  const start=source.indexOf('function checkReconnect(){')
