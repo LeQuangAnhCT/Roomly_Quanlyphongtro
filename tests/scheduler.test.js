@@ -108,3 +108,21 @@ test('all-day unavailability prevents assignment of anytime chores',()=>{
  const result=generateWeek({members:[{user_id:'a'},{user_id:'b'}],chores:[chore],busySlots:busy,weekStart:'2026-11-09'})
  assert.equal(result.rows[0].assignee_id,'b')
 })
+
+test('dishwashing lunch and dinner are one turn category and all members rotate before repeating',()=>{
+ const members=['a','b','c'].map(user_id=>({user_id}))
+ const chores=[
+ {id:'dl',name:'Rửa chén buổi trưa',icon:'dishes_lunch',room_id:'r',time_mode:'timed',start_time:'12:00',duration_minutes:30,weight:1,weekdays:[1,2,3,4,5,6,7]},
+ {id:'dd',name:'Rửa chén buổi tối',icon:'dishes_dinner',room_id:'r',time_mode:'timed',start_time:'19:00',duration_minutes:30,weight:1,weekdays:[1,2,3,4,5,6,7]}
+ ]
+ const result=generateWeek({members,chores,weekStart:'2026-11-09'})
+ assert.equal(choreCategory(chores[0]),'dishes')
+ assert.equal(choreCategory(chores[1]),'dishes')
+ assert.equal(result.rows.length,14)
+ for(let i=0;i<12;i+=3)
+  assert.equal(new Set(result.rows.slice(i,i+3).map(a=>a.assignee_id)).size,3)
+ const following=generateWeek({members,chores,history:result.rows,weekStart:'2026-11-16'})
+ const combined=[...result.rows,...following.rows]
+ for(let i=0;i<combined.length-2;i+=3)
+  assert.equal(new Set(combined.slice(i,i+3).map(a=>a.assignee_id)).size,3)
+})
