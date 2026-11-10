@@ -29,6 +29,19 @@ test('background realtime membership check keeps workspace visible',()=>{
  assert.match(source,/loadEverything\(\{silent:true\}\)/)
 })
 test('focusing the app is rate-limited and does not force a visible loader',()=>{
- assert.match(source,/Date\.now\(\)-lastReconnect<15000/)
+ assert.match(source,/Date\.now\(\)-lastReconnect<30000/)
  assert.match(source,/queueLiveRefresh\(true\)/)
+})
+
+test('tab switching does not use out-in transition that blanks and remounts the page',()=>{
+ assert.doesNotMatch(source,/<Transition name="page" mode="out-in">/)
+ assert.match(source,/<template>\s*<section v-if="currentTab==='schedule'"/)
+})
+test('focus only refreshes background data, no unconditional whole-room reload',()=>{
+ const start=source.indexOf('function checkReconnect(){')
+ const end=source.indexOf('let dayWatcher=',start)
+ const body=source.slice(start,end)
+ assert.match(body,/queueLiveRefresh\(false\)/)
+ assert.match(body,/liveState\.value==='reconnecting'/)
+ assert.doesNotMatch(body,/queueLiveRefresh\(true\)\s*\n}/)
 })
