@@ -2,12 +2,12 @@
 import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
 import {House,CalendarDays,UsersRound,ListTodo,BarChart3,Settings,LogOut,Bell,Plus,ChevronLeft,ChevronRight,ChevronDown,Check,CheckCircle2,Clock3,Utensils,Sun,Shirt,Droplets,Shuffle,Trash2,Pencil,Copy,X,RefreshCw,ArrowRightLeft,Menu,AlertCircle,ShieldCheck,LoaderCircle} from 'lucide-vue-next'
 import {supabase,configured,check} from './supabase.js'
-import {generateWeek,mondayOf,dateAt} from './scheduler.js'
+import {generateWeek,mondayOf,dateAt,isBusy,overlap} from './scheduler.js'
 const iconFor={lunch:Utensils,dinner:Utensils,wash:Shirt,dry:Sun,water:Droplets}
 const user=ref(null),booting=ref(true),busy=ref(false),message=ref(''),error=ref(''),loginEmail=ref(''),emailSent=ref(false)
-const currentTab=ref('schedule'),modal=ref(''),menuOpen=ref(false),room=ref(null),members=ref([]),chores=ref([]),assignments=ref([]),availability=ref([]),swaps=ref([]),notifications=ref([]),profiles=ref([])
+const currentTab=ref('schedule'),modal=ref(''),menuOpen=ref(false),room=ref(null),members=ref([]),chores=ref([]),assignments=ref([]),availability=ref([]),busySlots=ref([]),debts=ref([]),swaps=ref([]),notifications=ref([]),profiles=ref([])
 const weekStart=ref(mondayOf(new Date().toISOString().slice(0,10))),selectedDay=ref(new Date().toISOString().slice(0,10))
-const filter=ref('all'),draft=ref({}),joinCode=ref(''),groupName=ref(''),draftName=ref(''),newRecipient=ref(''),activeAssignment=ref(null),warnings=ref([]),showCompleted=ref(true),manualChore=ref(''),manualPerson=ref(''),roomDraft=ref('')
+const busyDraft=ref({mode:'weekly',weekday:1,busy_date:'',starts_at:'07:00',ends_at:'12:00',reason:'Đi học'}),debtDraft=ref({debt_id:'',chore_id:'',work_date:''}),debtReason=ref(''),filter=ref('all'),draft=ref({}),joinCode=ref(''),groupName=ref(''),draftName=ref(''),newRecipient=ref(''),activeAssignment=ref(null),warnings=ref([]),showCompleted=ref(true),manualChore=ref(''),manualPerson=ref(''),roomDraft=ref('')
 const fullName=computed(()=>profiles.value.find(p=>p.user_id===user.value?.id)?.display_name||user.value?.user_metadata?.full_name||user.value?.email?.split('@')[0]||'Bạn')
 const isOwner=computed(()=>room.value?.owner_id===user.value?.id)
 const weekdays=['T2','T3','T4','T5','T6','T7','CN']
@@ -21,6 +21,20 @@ const myTasks=computed(()=>assignments.value.filter(a=>a.assignee_id===user.valu
 const myDone=computed(()=>myTasks.value.filter(a=>a.status==='done').length)
 const pendingSwaps=computed(()=>swaps.value.filter(s=>s.to_user===user.value?.id&&s.status==='pending'))
 const unread=computed(()=>notifications.value.filter(n=>!n.read_at).length)
+const myBusy=computed(()=>busySlots.value.filter(b=>b.user_id===user.value?.id).sort((a,b)=>String(a.busy_date||a.weekday).localeCompare(String(b.busy_date||b.weekday))||a.starts_at.localeCompare(b.starts_at)))
+const owedDebts=computed(()=>debts.value.filter(d=>d.status==='owed'))
+const myDebts=computed(()=>owedDebts.value.filter(d=>d.user_id===user.value?.id))
+const formatBusy=b=>b.busy_date ? b.busy_date.split('-').reverse().join('/') : weekdays[Number(b.weekday)-1]
+function canTakeTransfer(personId,assignment) {
+ const c=choreOf(assignment.chore_id)
+ if(!c||personId===assignment.assignee_id)return false
+ const day=(new Date(assignment.work_date+'T00:00:00Z').getUTCDay()+6)%7+1
+ return !isBusy({userId:personId,date:assignment.work_date,weekday:day,chore:c,busySlots:busySlots.value,availability:availability.value}) &&
+  !assignments.value.some(a=>a.id!==assignment.id && a.assignee_id===personId &&
+   a.work_date===assignment.work_date && a.status!=='skipped' && overlap(choreOf(a.chore_id)||c,c))
+}
+const transferCandidates=computed(()=>activeAssignment.value ? members.value.filter(m=>canTakeTransfer(m.user_id,activeAssignment.value)) : [])
+
 const stats=computed(()=>members.value.filter(m=>m.active).map(m=>{const assigned=assignments.value.filter(a=>a.assignee_id===m.user_id);return {...m,assigned:assigned.length,done:assigned.filter(a=>a.status==='done').length,points:assigned.reduce((n,a)=>n+Number(choreOf(a.chore_id)?.weight||1),0)}}))
 function toast(s,fail=false){if(fail)error.value=s;else message.value=s;setTimeout(()=>{message.value='';error.value=''},5000)}
 function localErr(e){
@@ -48,7 +62,7 @@ async function login(){
 }
 async function emailLogin(){await run(async()=>{const email=loginEmail.value.trim().toLowerCase();if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw Error('Nhập địa chỉ email hợp lệ');await check(await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin,shouldCreateUser:true}}));emailSent.value=true;toast('Đã gửi liên kết đăng nhập. Kiểm tra hộp thư của bạn.')})}
 async function logout(){await run(async()=>{await check(await supabase.auth.signOut({scope:'local'}));reset();toast('Đã đăng xuất')})}
-function reset(){room.value=null;members.value=[];chores.value=[];assignments.value=[];profiles.value=[];availability.value=[];swaps.value=[];notifications.value=[];currentTab.value='schedule';modal.value=''}
+function reset(){room.value=null;members.value=[];chores.value=[];assignments.value=[];profiles.value=[];availability.value=[];busySlots.value=[];debts.value=[];swaps.value=[];notifications.value=[];currentTab.value='schedule';modal.value=''}
 let authSubscription=null
 let sessionRevision=0
 async function init(){
@@ -97,9 +111,11 @@ async function refresh(){if(!room.value)return;const id=room.value.id;const resu
  supabase.from('chores').select('*').eq('room_id',id).order('start_time'),
  supabase.from('assignments').select('*').eq('room_id',id).gte('work_date',dateAt(weekStart.value,-28)).lte('work_date',dateAt(weekStart.value,6)).order('work_date'),
  supabase.from('member_availability').select('*').eq('room_id',id),
+ supabase.from('room_busy_slots').select('*').eq('room_id',id).order('starts_at'),
+ supabase.from('room_work_debts').select('*').eq('room_id',id).order('created_at',{ascending:false}),
  supabase.from('swap_requests').select('*').eq('room_id',id).order('created_at',{ascending:false}),
  supabase.from('room_notifications').select('*').eq('user_id',user.value.id).order('created_at',{ascending:false}).limit(50)
- ]);const [m,c,a,v,s,n]=await Promise.all(results.map(check));members.value=m;chores.value=c;assignments.value=a;availability.value=v;swaps.value=s;notifications.value=n;
+ ]);const [m,c,a,v,b,d,s,n]=await Promise.all(results.map(check));members.value=m;chores.value=c;assignments.value=a;availability.value=v;busySlots.value=b;debts.value=d;swaps.value=s;notifications.value=n;
  profiles.value=m.length?await check(await supabase.from('room_profiles').select('user_id,display_name,avatar_url').in('user_id',m.map(x=>x.user_id))):[]}
 async function createRoom(){await run(async()=>{if(!groupName.value.trim())throw Error('Nhập tên nhóm trọ');await check(await supabase.rpc('room_create',{p_name:groupName.value.trim()}));groupName.value='';await loadEverything();toast('Đã tạo nhóm trọ')})}
 async function joinRoom(){await run(async()=>{if(!joinCode.value.trim())throw Error('Nhập mã mời');await check(await supabase.rpc('room_join',{p_code:joinCode.value.trim()}));joinCode.value='';await loadEverything();toast('Đã gia nhập nhóm trọ')})}
@@ -114,11 +130,59 @@ function moveWeek(n){weekStart.value=dateAt(weekStart.value,n*7);selectedDay.val
 async function saveManual(){await run(async()=>{if(!manualChore.value||!manualPerson.value)throw Error('Chọn công việc và người thực hiện');await check(await supabase.rpc('room_assign_manual',{p_room:room.value.id,p_chore:manualChore.value,p_date:selectedDay.value,p_user:manualPerson.value}));modal.value='';await refresh();toast('Đã phân công thủ công')})}
 async function renameRoom(){await run(async()=>{await check(await supabase.rpc('room_rename',{p_room:room.value.id,p_name:roomDraft.value}));room.value={...room.value,name:roomDraft.value.trim()};modal.value='';toast('Đã đổi tên nhóm')})}
 async function disbandRoom(){if(!confirm('Giải tán nhóm sẽ xóa toàn bộ lịch, thành viên và dữ liệu nhóm. Bạn chắc chắn?'))return;await run(async()=>{await check(await supabase.rpc('room_disband',{p_room:room.value.id}));reset();toast('Đã giải tán nhóm')})}
-async function autoSchedule(){if(!isOwner.value)return;const existing=assignments.value.filter(a=>a.work_date<weekStart.value);const future=assignments.value.filter(a=>a.work_date>=weekStart.value&&a.work_date<=dateAt(weekStart.value,6));if(future.some(a=>a.status==='done'))return toast('Không thể tạo lại lịch tuần đã có việc hoàn thành.',true);const result=generateWeek({members:members.value,chores:chores.value,availability:availability.value,history:existing.map(a=>({...a,weight:choreOf(a.chore_id)?.weight||1})),weekStart:weekStart.value});warnings.value=result.warnings; if(!result.rows.length)return toast('Không có việc nào để phân. Kiểm tra ngày rảnh hoặc danh mục việc.',true);if(!confirm(`Phân ${result.rows.length} lượt việc trong tuần? Lịch chưa hoàn thành của tuần này sẽ được tạo lại.`))return;await run(async()=>{await check(await supabase.rpc('room_replace_week',{p_room:room.value.id,p_start:weekStart.value,p_rows:result.rows.map(({room_id,chore_id,work_date,assignee_id})=>({chore_id,work_date,assignee_id}))}));await refresh();toast(`Đã phân ${result.rows.length} công việc`);modal.value=warnings.value.length?'warnings':''})}
+async function autoSchedule(){if(!isOwner.value)return;const existing=assignments.value.filter(a=>a.work_date<weekStart.value);const future=assignments.value.filter(a=>a.work_date>=weekStart.value&&a.work_date<=dateAt(weekStart.value,6));if(future.some(a=>a.status!=='pending'||a.makeup_debt_id))return toast('Tuần có việc đã hoàn thành, bị nợ hoặc lịch bù nên không thể tạo lại.',true);const result=generateWeek({members:members.value,chores:chores.value,availability:availability.value,busySlots:busySlots.value,history:existing.map(a=>({...a,weight:choreOf(a.chore_id)?.weight||1})),weekStart:weekStart.value});warnings.value=result.warnings; if(!result.rows.length)return toast('Không có việc nào để phân. Kiểm tra ngày rảnh hoặc danh mục việc.',true);if(!confirm(`Phân ${result.rows.length} lượt việc trong tuần? Lịch chưa hoàn thành của tuần này sẽ được tạo lại.`))return;await run(async()=>{await check(await supabase.rpc('room_replace_week',{p_room:room.value.id,p_start:weekStart.value,p_rows:result.rows.map(({room_id,chore_id,work_date,assignee_id})=>({chore_id,work_date,assignee_id}))}));await refresh();toast(`Đã phân ${result.rows.length} công việc`);modal.value=warnings.value.length?'warnings':''})}
 async function complete(a){await run(async()=>{await check(await supabase.rpc('room_complete_assignment',{p_id:a.id,p_done:a.status!=='done'}));await refresh();toast(a.status==='done'?'Đã hoàn tác':'Đã đánh dấu hoàn thành')})}
-function openSwap(a){activeAssignment.value=a;newRecipient.value='';modal.value='swap'}
-async function requestSwap(){await run(async()=>{if(!newRecipient.value)throw Error('Chọn người nhận việc');await check(await supabase.from('swap_requests').insert({room_id:room.value.id,assignment_id:activeAssignment.value.id,from_user:user.value.id,to_user:newRecipient.value}));modal.value='';await refresh();toast('Đã gửi yêu cầu đổi việc')})}
+function openSwap(a){activeAssignment.value=a;newRecipient.value='';debtReason.value='';modal.value='swap'}
+async function requestSwap(){await run(async()=>{if(!newRecipient.value||!canTakeTransfer(newRecipient.value,activeAssignment.value))throw Error('Chọn thành viên rảnh và không trùng giờ');await check(await supabase.from('swap_requests').insert({room_id:room.value.id,assignment_id:activeAssignment.value.id,from_user:user.value.id,to_user:newRecipient.value}));modal.value='';await refresh();toast('Đã gửi yêu cầu đổi việc')})}
 async function decideSwap(s,accept){await run(async()=>{await check(await supabase.rpc('room_resolve_swap',{p_id:s.id,p_accept:accept}));await refresh();toast(accept?'Đã nhận việc':'Đã từ chối')})}
+function openBusy(){
+ busyDraft.value={mode:'weekly',weekday:1,busy_date:selectedDay.value,starts_at:'07:00',ends_at:'12:00',reason:'Đi học'}
+ modal.value='busy'
+}
+async function saveBusy(){
+ await run(async()=>{
+  const d=busyDraft.value
+  if(!d.starts_at||!d.ends_at||d.starts_at>=d.ends_at)throw Error('Giờ kết thúc phải sau giờ bắt đầu')
+  if(!d.reason?.trim())throw Error('Nhập lý do bận')
+  const payload={room_id:room.value.id,user_id:user.value.id,
+   weekday:d.mode==='weekly'?Number(d.weekday):null,
+   busy_date:d.mode==='date'?d.busy_date:null,
+   starts_at:d.starts_at,ends_at:d.ends_at,reason:d.reason.trim()}
+  if(d.mode==='date'&&!d.busy_date)throw Error('Chọn ngày bận')
+  await check(await supabase.from('room_busy_slots').insert(payload))
+  modal.value=''
+  await refresh()
+  toast('Đã lưu lịch bận; các lần tự phân công sau sẽ tránh giờ này.')
+ })
+}
+async function removeBusy(id){
+ if(!confirm('Xóa khoảng thời gian bận này?'))return
+ await run(async()=>{await check(await supabase.from('room_busy_slots').delete().eq('id',id).eq('user_id',user.value.id));await refresh();toast('Đã xóa lịch bận')})
+}
+async function markDebt(){
+ if(!activeAssignment.value)return
+ if(!confirm('Chưa tìm được người nhận? Việc sẽ được đánh dấu chưa làm và ghi nợ để bù sau.'))return
+ await run(async()=>{
+  await check(await supabase.rpc('room_mark_uncovered',{p_assignment:activeAssignment.value.id,p_reason:debtReason.value}))
+  modal.value=''
+  await refresh()
+  toast('Đã ghi nợ việc. Trưởng nhóm có thể phân ca bù sau.')
+ })
+}
+function openMakeup(debt){
+ debtDraft.value={debt_id:debt.id,chore_id:chores.value.find(c=>c.enabled)?.id||'',work_date:dateAt(weekStart.value,7)}
+ modal.value='makeup'
+}
+async function scheduleMakeup(){
+ await run(async()=>{
+  const d=debtDraft.value
+  if(!d.chore_id||!d.work_date)throw Error('Chọn công việc và ngày bù')
+  await check(await supabase.rpc('room_schedule_makeup',{p_debt:d.debt_id,p_chore:d.chore_id,p_date:d.work_date}))
+  modal.value=''
+  await refresh()
+  toast('Đã lên lịch bù. Nợ chỉ được xóa sau khi hoàn thành việc bù.')
+ })
+}
 async function toggleAvailability(day){await run(async()=>{const old=availability.value.find(a=>a.user_id===user.value.id&&a.weekday===day);await check(await supabase.from('member_availability').upsert({room_id:room.value.id,user_id:user.value.id,weekday:day,available:old?.available===false}));await refresh()})}
 async function saveProfile(){await run(async()=>{const value=draftName.value.trim();if(!value||value.length>60)throw Error('Tên phải từ 1 đến 60 ký tự');await check(await supabase.from('room_profiles').update({display_name:value,updated_at:new Date().toISOString()}).eq('user_id',user.value.id));modal.value='';await refresh();toast('Đã cập nhật hồ sơ')})}
 async function readNotifications(){await run(async()=>{await check(await supabase.from('room_notifications').update({read_at:new Date().toISOString()}).eq('user_id',user.value.id).is('read_at',null));await refresh()})}
