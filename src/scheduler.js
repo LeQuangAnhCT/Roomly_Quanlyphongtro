@@ -1,5 +1,5 @@
-// Deterministic 7-day scheduling with round-robin cooking, time-specific
-// availability, and workload balancing across previous weeks.
+// Week scheduler: strict per-category, all-member rounds with carry-over history.
+// One cooking turn = either lunch OR dinner. One laundry turn = wash AND dry.
 export function dateAt(start, offset) {
   const d = new Date(start + 'T00:00:00Z')
   d.setUTCDate(d.getUTCDate() + offset)
@@ -20,6 +20,19 @@ export function isCooking(chore) {
   const name = String(chore?.name || '').toLowerCase()
   return icon === 'lunch' || icon === 'dinner' || /nấu|cơm|bếp/.test(name)
 }
+export function isLaundry(chore) {
+  const icon = String(chore?.icon || '').toLowerCase()
+  const name = String(chore?.name || '').toLowerCase()
+  return icon === 'wash' || icon === 'dry' || /giặt|phơi/.test(name)
+}
+export function choreCategory(chore) {
+  if (isCooking(chore)) return 'cooking'
+  if (isLaundry(chore)) return 'laundry'
+  const icon = String(chore?.icon || '').toLowerCase()
+  const name = String(chore?.name || '').toLowerCase()
+  if (icon === 'water' || /đổi.*nước|thay.*nước/.test(name)) return 'water'
+  return 'chore:' + String(chore?.id || chore?.name || 'other')
+}
 export function isBusy({userId, date, weekday, chore, busySlots = [], availability = []}) {
   if (availability.some(v => v.user_id === userId && Number(v.weekday) === weekday && v.available === false)) return true
   return busySlots.some(slot => slot.user_id === userId &&
@@ -28,37 +41,41 @@ export function isBusy({userId, date, weekday, chore, busySlots = [], availabili
     minutes(chore.start_time) < minutes(slot.ends_at))
 }
 /**
- * Every member finishes one round of cooking before that member gets the
- * next turn (when available). Lunch and dinner share a cooking queue.
- * Scores for other chores balance weighted work, history and repetitions.
- * Date-specific or repeating busy slots remove only conflicting hours.
- * No impossible shift is silently assigned.
+ * Each member must receive a turn in a category before anyone can receive
+ * another turn. Rounds survive Sunday/Monday via full preceding history.
+ * If all members who still owe a turn are unavailable, issue a warning and
+ * leave that shift unassigned; NEVER skip an unavailable member's turn.
+ * Completed/assigned historical jobs count, but skipped jobs do not.
+ * Ties are broken by last assignment (oldest first), workload and stable ID.
  */
 export function generateWeek({members, chores, availability = [], busySlots = [], history = [], weekStart}) {
   const active = members.filter(m => m.active !== false).slice()
     .sort((a, b) => String(a.user_id).localeCompare(String(b.user_id)))
   if (!active.length) return {rows: [], warnings: ['Nhóm chưa có thành viên.']}
   const loads = new Map(active.map(m => [m.user_id, 0]))
-  const cookCounts = new Map(active.map(m => [m.user_id, 0]))
-  const choreCounts = new Map()
-  const lastCook = new Map()
-  const lastChore = new Map()
+  const countsByCategory = new Map()
+  const lastByCategory = new Map()
   const rows = [], warnings = []
   const choreById = new Map(chores.map(c => [c.id, c]))
+  function categoryCounts(category) {
+    if (!countsByCategory.has(category))
+      countsByCategory.set(category, new Map(active.map(m => [m.user_id, 0])))
+    return countsByCategory.get(category)
+  }
   const historical = history.filter(a => a.status !== 'skipped')
-    .slice().sort((a, b) => String(a.work_date).localeCompare(String(b.work_date)))
+    .slice().sort((a, b) => String(a.work_date).localeCompare(String(b.work_date)) ||
+      String(choreById.get(a.chore_id)?.start_time || '').localeCompare(String(choreById.get(b.chore_id)?.start_time || '')) ||
+      String(a.id || '').localeCompare(String(b.id || '')))
   for (const a of historical) {
     if (!loads.has(a.assignee_id)) continue
     const c = choreById.get(a.chore_id)
-    const weight = Number(a.weight || c?.weight || 1)
-    loads.set(a.assignee_id, loads.get(a.assignee_id) + weight)
-    const key = a.assignee_id + ':' + a.chore_id
-    choreCounts.set(key, (choreCounts.get(key) || 0) + 1)
-    lastChore.set(key, a.work_date)
-    if (isCooking(c)) {
-      cookCounts.set(a.assignee_id, cookCounts.get(a.assignee_id) + 1)
-      lastCook.set(a.assignee_id, a.work_date)
-    }
+    if (!c) continue
+    const category = choreCategory(c)
+    const counts = categoryCounts(category)
+    counts.set(a.assignee_id, (counts.get(a.assignee_id) || 0) + 1)
+    const k = category + ':' + a.assignee_id
+    lastByCategory.set(k, a.work_date)
+    loads.set(a.assignee_id, loads.get(a.assignee_id) + Number(a.weight || c.weight || 1))
   }
   const tasks = chores.filter(c => c.enabled !== false).slice()
     .sort((a, b) => Number(isCooking(b)) - Number(isCooking(a)) ||
@@ -66,61 +83,44 @@ export function generateWeek({members, chores, availability = [], busySlots = []
       String(a.id).localeCompare(String(b.id)))
   for (let day = 0; day < 7; day++) {
     const work_date = dateAt(weekStart, day), weekday = day + 1, used = []
-    const today = tasks.filter(c => (c.weekdays || []).map(Number).includes(weekday))
-    for (const chore of today) {
-      const cooking = isCooking(chore)
-      const possible = active.filter(m =>
+    for (const chore of tasks.filter(c => (c.weekdays || []).map(Number).includes(weekday))) {
+      const category = choreCategory(chore)
+      const counts = categoryCounts(category)
+      // Hard round boundary: candidate's count must be the minimum of ALL
+      // active members, not just the people available at this time.
+      const minimumTurns = Math.min(...active.map(m => counts.get(m.user_id) || 0))
+      const eligible = active.filter(m => (counts.get(m.user_id) || 0) === minimumTurns &&
         !isBusy({userId: m.user_id, date: work_date, weekday, chore, availability, busySlots}) &&
-        !used.some(row => row.assignee_id === m.user_id && overlap(row, chore))
-      )
-      // Avoid allocating both meals to the same person on one day if another
-      // qualified cook can take the other meal.
-      const unusedCooks = cooking ? possible.filter(m =>
-        !used.some(row => row.assignee_id === m.user_id && isCooking(choreById.get(row.chore_id)))) : possible
-      const candidates = unusedCooks.length ? unusedCooks : possible
-      if (!candidates.length) {
-        warnings.push(work_date + ': Không có người rảnh để làm ' + chore.name)
+        !used.some(row => row.assignee_id === m.user_id && overlap(row, chore)))
+      if (!eligible.length) {
+        warnings.push(work_date + ': Chưa phân ' + chore.name +
+          ' — người chưa đến lượt tiếp theo đều bận hoặc trùng giờ; không tự lặp người đã làm.')
         continue
       }
-      const ranked = candidates.map(m => {
-        const key = m.user_id + ':' + chore.id
-        const daysSince = lastChore.has(key) ? Math.round((Date.parse(work_date) -
-          Date.parse(lastChore.get(key))) / 86400000) : 999
-        const recent = daysSince <= 2 ? 6 : daysSince <= 6 ? 2 : 0
-        const score = cooking
-          ? [
-              cookCounts.get(m.user_id) || 0, // hard rotation: fewest completed turns first
-              lastCook.has(m.user_id) ? Date.parse(lastCook.get(m.user_id)) : -1,
-              loads.get(m.user_id) || 0
-            ]
-          : [
-              loads.get(m.user_id) || 0,
-              (choreCounts.get(key) || 0) * 3 + recent,
-              0
-            ]
-        return {m, score}
-      }).sort((a, b) => {
-        for (let i = 0; i < a.score.length; i++)
-          if (a.score[i] !== b.score[i]) return a.score[i] - b.score[i]
-        return String(a.m.user_id).localeCompare(String(b.m.user_id))
+      const ranked = eligible.sort((a, b) => {
+        const lastA = lastByCategory.get(category + ':' + a.user_id) || ''
+        const lastB = lastByCategory.get(category + ':' + b.user_id) || ''
+        return lastA.localeCompare(lastB) ||
+          (loads.get(a.user_id) || 0) - (loads.get(b.user_id) || 0) ||
+          String(a.user_id).localeCompare(String(b.user_id))
       })
-      const selected = ranked[0].m
+      // Within the same day, favor different cooks for lunch vs dinner,
+      // without breaking the all-member round rule.
+      const chosen = isCooking(chore)
+        ? ranked.find(m => !used.some(row => row.assignee_id === m.user_id &&
+            choreCategory(choreById.get(row.chore_id)) === 'cooking')) || ranked[0]
+        : ranked[0]
       const row = {
         room_id: chore.room_id, chore_id: chore.id, work_date,
-        assignee_id: selected.user_id, status: 'pending',
+        assignee_id: chosen.user_id, status: 'pending',
         start_time: chore.start_time, duration_minutes: chore.duration_minutes,
         weight: chore.weight, name: chore.name
       }
       rows.push(row)
       used.push(row)
-      loads.set(selected.user_id, loads.get(selected.user_id) + Number(chore.weight || 1))
-      const key = selected.user_id + ':' + chore.id
-      choreCounts.set(key, (choreCounts.get(key) || 0) + 1)
-      lastChore.set(key, work_date)
-      if (cooking) {
-        cookCounts.set(selected.user_id, cookCounts.get(selected.user_id) + 1)
-        lastCook.set(selected.user_id, work_date)
-      }
+      counts.set(chosen.user_id, minimumTurns + 1)
+      lastByCategory.set(category + ':' + chosen.user_id, work_date)
+      loads.set(chosen.user_id, (loads.get(chosen.user_id) || 0) + Number(chore.weight || 1))
     }
   }
   return {rows, warnings}
