@@ -21,3 +21,14 @@ test('stale membership requests cannot replace a new authenticated session',()=>
  assert.match(source,/const revision=sessionRevision/)
  assert.match(source,/revision!==sessionRevision\|\|user\.value\?\.id!==accountId/)
 })
+
+test('background realtime membership check keeps workspace visible',()=>{
+ assert.match(source,/async function loadEverything\(\{silent=false\}=\{\}\)/)
+ assert.match(source,/const background=silent&&roomStatus\.value==='ready'&&!!room\.value/)
+ assert.match(source,/if\(!background\)roomStatus\.value='loading'/)
+ assert.match(source,/loadEverything\(\{silent:true\}\)/)
+})
+test('focusing the app is rate-limited and does not force a visible loader',()=>{
+ assert.match(source,/Date\.now\(\)-lastReconnect<15000/)
+ assert.match(source,/queueLiveRefresh\(true\)/)
+})
