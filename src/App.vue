@@ -4,7 +4,7 @@ import {House,CalendarDays,UsersRound,ListTodo,BarChart3,Settings,LogOut,Bell,Pl
 import {supabase,configured,check} from './supabase.js'
 import {generateWeek,mondayOf,dateAt,isBusy,overlap,isAnytime} from './scheduler.js'
 const iconFor={lunch:Utensils,dinner:Utensils,wash:Shirt,dry:Sun,water:Droplets}
-const user=ref(null),booting=ref(true),busy=ref(false),message=ref(''),error=ref(''),loginEmail=ref(''),emailSent=ref(false)
+const user=ref(null),booting=ref(true),roomStatus=ref('loading'),roomLoadError=ref(''),busy=ref(false),message=ref(''),error=ref(''),loginEmail=ref(''),emailSent=ref(false)
 const currentTab=ref('schedule'),modal=ref(''),menuOpen=ref(false),room=ref(null),members=ref([]),chores=ref([]),assignments=ref([]),availability=ref([]),busySlots=ref([]),debts=ref([]),swaps=ref([]),notifications=ref([]),profiles=ref([])
 const weekStart=ref(mondayOf(new Date().toISOString().slice(0,10))),selectedDay=ref(new Date().toISOString().slice(0,10))
 const busyDraft=ref({mode:'weekly',weekday:1,busy_date:'',starts_at:'07:00',ends_at:'12:00',reason:'Đi học'}),debtDraft=ref({debt_id:'',chore_id:'',work_date:''}),debtReason=ref(''),filter=ref('all'),draft=ref({}),joinCode=ref(''),groupName=ref(''),draftName=ref(''),newRecipient=ref(''),activeAssignment=ref(null),warnings=ref([]),showCompleted=ref(true),manualChore=ref(''),manualPerson=ref(''),roomDraft=ref('')
@@ -70,7 +70,7 @@ async function login(){
 }
 async function emailLogin(){await run(async()=>{const email=loginEmail.value.trim().toLowerCase();if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw Error('Nhập địa chỉ email hợp lệ');await check(await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin,shouldCreateUser:true}}));emailSent.value=true;toast('Đã gửi liên kết đăng nhập. Kiểm tra hộp thư của bạn.')})}
 async function logout(){await run(async()=>{await check(await supabase.auth.signOut({scope:'local'}));reset();toast('Đã đăng xuất')})}
-function reset(){room.value=null;members.value=[];chores.value=[];assignments.value=[];profiles.value=[];availability.value=[];busySlots.value=[];debts.value=[];swaps.value=[];notifications.value=[];currentTab.value='schedule';modal.value=''}
+function reset(){room.value=null;roomStatus.value='loading';roomLoadError.value='';members.value=[];chores.value=[];assignments.value=[];profiles.value=[];availability.value=[];busySlots.value=[];debts.value=[];swaps.value=[];notifications.value=[];currentTab.value='schedule';modal.value=''}
 let authSubscription=null
 let sessionRevision=0
 async function init(){
@@ -108,11 +108,38 @@ async function init(){
   }
  }
 }
-async function loadEverything(){if(!user.value)return;try{
- const own=await check(await supabase.from('room_members').select('room_id,active').eq('user_id',user.value.id).eq('active',true).limit(1));
- if(!own?.length){reset();await ensureProfile();return}
- const r=await check(await supabase.from('rooms').select('*').eq('id',own[0].room_id).single());room.value=r;await ensureProfile();await refresh()
- }catch(e){toast(localErr(e),true)}finally{booting.value=false}}
+async function loadEverything(){
+ const accountId=user.value?.id
+ if(!accountId)return
+ const revision=sessionRevision
+ roomStatus.value='loading'
+ roomLoadError.value=''
+ try{
+  const own=await check(await supabase.from('room_members')
+   .select('room_id').eq('user_id',accountId).eq('active',true).limit(1))
+  // A previous account's request must never overwrite a newer session.
+  if(revision!==sessionRevision||user.value?.id!==accountId)return
+  if(!own?.length){
+   room.value=null
+   members.value=[];chores.value=[];assignments.value=[]
+   await ensureProfile()
+   if(revision===sessionRevision&&user.value?.id===accountId)roomStatus.value='none'
+   return
+  }
+  const r=await check(await supabase.from('rooms').select('*')
+   .eq('id',own[0].room_id).single())
+  if(revision!==sessionRevision||user.value?.id!==accountId)return
+  room.value=r
+  await ensureProfile()
+  await refresh()
+  if(revision===sessionRevision&&user.value?.id===accountId)roomStatus.value='ready'
+ }catch(e){
+  if(revision===sessionRevision&&user.value?.id===accountId){
+   roomLoadError.value=localErr(e)
+   roomStatus.value='error'
+  }
+ }finally{booting.value=false}
+}
 async function ensureProfile(){if(!user.value)return;const p={user_id:user.value.id,display_name:user.value.user_metadata?.full_name||user.value.email?.split('@')[0]||'Thành viên',avatar_url:user.value.user_metadata?.avatar_url||null};const existing=await check(await supabase.from('room_profiles').select('user_id').eq('user_id',user.value.id).maybeSingle());if(!existing)await check(await supabase.from('room_profiles').insert(p))}
 async function refresh(){if(!room.value)return;const id=room.value.id;const results=await Promise.all([
  supabase.from('room_members').select('*').eq('room_id',id).eq('active',true),
@@ -202,10 +229,17 @@ onMounted(init);onUnmounted(()=>{authSubscription?.unsubscribe();if(channel&&sup
 
 <template>
 <div class="app-root">
-  <div v-if="booting" class="center-screen"><div class="brand-icon large"><House :size="30"/></div><h1>ROOMLY</h1><LoaderCircle class="spin" :size="24"/><p>Đang khởi động ứng dụng...</p></div>
+  <div v-if="booting||(user&&roomStatus==='loading')" class="center-screen"><div class="brand-icon large"><House :size="30"/></div><h1>ROOMLY</h1><LoaderCircle class="spin" :size="24"/><p>Đang khởi động ứng dụng...</p></div>
   <div v-else-if="!configured" class="center-screen"><div class="brand-icon large"><House :size="30"/></div><h1>ROOMLY</h1><p>Chưa cấu hình Supabase. Thêm VITE_SUPABASE_URL và VITE_SUPABASE_PUBLISHABLE_KEY trong Vercel.</p></div>
   <div v-else-if="!user" class="login-screen"><div class="brand-top"><div class="brand-icon"><House :size="25"/></div><b>ROOMLY</b></div><div class="login-content"><span class="eyebrow">KHÔNG GIAN SỐNG CHUNG</span><h1>Ở chung dễ dàng.<br><span>Chia việc công bằng.</span></h1><p>Lên lịch nấu ăn, giặt giũ, phơi đồ và mọi công việc trong phòng trọ — minh bạch suốt 7 ngày.</p><button class="btn btn-dark login-btn" :disabled="busy" @click="login"><svg width="21" height="21" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 8.11 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.28 5.48-4.82 7.18l7.73 6C44.36 38.03 46.98 31.88 46.98 24.55z"/><path fill="#FBBC05" d="M10.53 28.59A14.4 14.4 0 0 1 9.75 24c0-1.59.27-3.13.76-4.59l-7.98-6.19A23.87 23.87 0 0 0 0 24c0 3.87.93 7.53 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.92-2.13 15.89-5.8l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Tiếp tục với Google</button><small>Đăng nhập bằng Google hoặc nhận liên kết qua email.</small><p v-if="error" role="alert" class="login-error">{{error}}</p><div class="email-login"><label for="loginEmail">Đăng nhập bằng email</label><div class="email-login-row"><input id="loginEmail" type="email" autocomplete="email" v-model="loginEmail" placeholder="email@example.com"/><button class="btn btn-outline" :disabled="busy" @click="emailLogin">Gửi liên kết</button></div><p v-if="emailSent" role="status">Đã gửi email. Hãy kiểm tra hộp thư, kể cả thư rác.</p></div></div><footer>© 2026 ROOMLY · Đơn giản · Công bằng</footer></div>
-  <div v-else-if="!room" class="onboard-screen"><header class="app-header"><div class="brand"><span class="brand-icon"><House :size="20"/></span><b>ROOMLY</b></div><button class="icon-button" title="Đăng xuất" @click="logout"><LogOut :size="20"/></button></header><div class="onboard"><span class="eyebrow">CHÀO MỪNG BẠN</span><h1>Bắt đầu với nhóm trọ</h1><p>Tạo nhóm mới để quản lý hoặc nhập mã mời của nhóm đã có.</p><div class="surface"><h3><House :size="20"/> Tạo nhóm mới</h3><label>Tên nhóm trọ</label><input v-model="groupName" placeholder="Ví dụ: Phòng trọ 2026" maxlength="80"/><button class="btn btn-dark" :disabled="busy" @click="createRoom"><Plus :size="17"/> Tạo nhóm trọ</button></div><div class="or">HOẶC</div><div class="surface"><h3><UsersRound :size="20"/> Tham gia nhóm</h3><label>Mã mời nhóm trọ</label><input v-model="joinCode" placeholder="Nhập mã 10 ký tự" maxlength="10"/><button class="btn btn-outline" :disabled="busy" @click="joinRoom">Gia nhập nhóm</button></div></div></div>
+  <div v-else-if="roomStatus==='error'" class="center-screen" role="alert">
+   <div class="brand-icon large"><AlertCircle :size="27"/></div>
+   <h1>Không tải được nhóm trọ</h1>
+   <p>{{roomLoadError||'Không thể kiểm tra thông tin nhóm. Vui lòng thử lại.'}}</p>
+   <button class="btn btn-dark" @click="loadEverything"><RefreshCw :size="17"/> Thử tải lại</button>
+   <small>Dữ liệu nhóm và các phân công vẫn được lưu trên Supabase.</small>
+  </div>
+  <div v-else-if="roomStatus==='none'&&!room" class="onboard-screen"><header class="app-header"><div class="brand"><span class="brand-icon"><House :size="20"/></span><b>ROOMLY</b></div><button class="icon-button" title="Đăng xuất" @click="logout"><LogOut :size="20"/></button></header><div class="onboard"><span class="eyebrow">CHÀO MỪNG BẠN</span><h1>Bắt đầu với nhóm trọ</h1><p>Tạo nhóm mới để quản lý hoặc nhập mã mời của nhóm đã có.</p><div class="surface"><h3><House :size="20"/> Tạo nhóm mới</h3><label>Tên nhóm trọ</label><input v-model="groupName" placeholder="Ví dụ: Phòng trọ 2026" maxlength="80"/><button class="btn btn-dark" :disabled="busy" @click="createRoom"><Plus :size="17"/> Tạo nhóm trọ</button></div><div class="or">HOẶC</div><div class="surface"><h3><UsersRound :size="20"/> Tham gia nhóm</h3><label>Mã mời nhóm trọ</label><input v-model="joinCode" placeholder="Nhập mã 10 ký tự" maxlength="10"/><button class="btn btn-outline" :disabled="busy" @click="joinRoom">Gia nhập nhóm</button></div></div></div>
   <div v-else class="workspace"><header class="app-header"><div class="brand"><span class="brand-icon"><House :size="20"/></span><span><b>ROOMLY</b><small>{{room.name}} · {{members.length}} thành viên</small></span></div><div class="header-actions"><button class="icon-button notification-button" title="Thông báo" @click="currentTab='notifications'"><Bell :size="20"/><i v-if="unread">{{unread}}</i></button><button class="avatar-button" @click="menuOpen=!menuOpen">{{initials(user.id)}}</button><Transition name="fade"><div v-if="menuOpen" class="account-popover"><strong>{{fullName}}</strong><small>{{user.email}}</small><button @click="draftName=fullName;modal='profile';menuOpen=false"><Pencil :size="16"/> Chỉnh sửa tên</button><button @click="currentTab='settings';menuOpen=false"><Settings :size="16"/> Cài đặt</button><button @click="logout"><LogOut :size="16"/> Đăng xuất</button></div></Transition></div></header>
   <main class="main-area">
    <Transition name="page" mode="out-in">
