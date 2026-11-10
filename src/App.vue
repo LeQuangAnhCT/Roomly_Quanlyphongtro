@@ -108,11 +108,13 @@ async function init(){
   }
  }
 }
-async function loadEverything(){
+async function loadEverything({silent=false}={}){
  const accountId=user.value?.id
  if(!accountId)return
  const revision=sessionRevision
- roomStatus.value='loading'
+ // A background membership check must never unmount the workspace.
+ const background=silent&&roomStatus.value==='ready'&&!!room.value
+ if(!background)roomStatus.value='loading'
  roomLoadError.value=''
  try{
   const own=await check(await supabase.from('room_members')
@@ -129,15 +131,20 @@ async function loadEverything(){
   const r=await check(await supabase.from('rooms').select('*')
    .eq('id',own[0].room_id).single())
   if(revision!==sessionRevision||user.value?.id!==accountId)return
-  room.value=r
-  await ensureProfile()
-  await maybeRolloverDishes(r.id)
+  // Preserve the workspace while a routine background check is running.
+  if(!background||room.value?.id!==r.id)room.value=r
+  if(!background)await ensureProfile()
+  if(!background)await maybeRolloverDishes(r.id)
   await refresh()
   if(revision===sessionRevision&&user.value?.id===accountId)roomStatus.value='ready'
  }catch(e){
   if(revision===sessionRevision&&user.value?.id===accountId){
-   roomLoadError.value=localErr(e)
-   roomStatus.value='error'
+   if(background){
+    console.warn('Background room check failed:',localErr(e))
+   }else{
+    roomLoadError.value=localErr(e)
+    roomStatus.value='error'
+   }
   }
  }finally{booting.value=false}
 }
@@ -248,7 +255,7 @@ function queueLiveRefresh(membership=false){
   const shouldReload=Boolean(liveRequest)
   liveRequest=0
   try{
-   if(shouldReload)await loadEverything()
+   if(shouldReload)await loadEverything({silent:true})
    else if(room.value)await refresh()
   }catch(e){liveState.value='error';console.warn('Roomly realtime synchronization failed',e)}
  },220)
@@ -286,9 +293,9 @@ watch(()=>user.value?.id,id=>{
 })
 function checkReconnect(){
  if(!user.value||document.visibilityState==='hidden')return
- if(room.value)maybeRolloverDishes(room.value.id).then(()=>queueLiveRefresh(false)).catch(()=>{})
- if(Date.now()-lastReconnect<2500)return
+ if(Date.now()-lastReconnect<15000)return
  lastReconnect=Date.now()
+ if(room.value)maybeRolloverDishes(room.value.id).then(()=>queueLiveRefresh(false)).catch(()=>{})
  queueLiveRefresh(true)
 }
 let dayWatcher=null
