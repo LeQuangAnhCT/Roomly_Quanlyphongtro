@@ -37,6 +37,8 @@ export function choreCategory(chore) {
   if (isCooking(chore)) return 'cooking'
   if (isLaundry(chore)) return 'laundry'
   const icon = String(chore?.icon || '').toLowerCase()
+  if (icon === 'dishes_lunch' || icon === 'dishes_dinner' ||
+      /rửa\s*(chén|bát)/i.test(String(chore?.name || ''))) return 'dishes'
   const name = String(chore?.name || '').toLowerCase()
   if (icon === 'water' || /đổi.*nước|thay.*nước/.test(name)) return 'water'
   return 'chore:' + String(chore?.id || chore?.name || 'other')
