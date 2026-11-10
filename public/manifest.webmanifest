@@ -1,0 +1,31 @@
+{
+  "id": "/",
+  "name": "Roomly — Quản lý nhóm trọ",
+  "short_name": "Roomly",
+  "description": "Quản lý nhóm trọ, lịch làm việc nhà và phân công công bằng",
+  "lang": "vi",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": [
+    "standalone",
+    "minimal-ui"
+  ],
+  "orientation": "any",
+  "background_color": "#ffffff",
+  "theme_color": "#111111",
+  "icons": [
+    {
+      "src": "/icons/roomly-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/roomly-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
