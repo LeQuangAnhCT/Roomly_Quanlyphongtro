@@ -291,8 +291,21 @@ function checkReconnect(){
  lastReconnect=Date.now()
  queueLiveRefresh(true)
 }
-onMounted(()=>{init();window.addEventListener('focus',checkReconnect);window.addEventListener('online',checkReconnect);document.addEventListener('visibilitychange',checkReconnect)})
+let dayWatcher=null
+let observedDay=localVietnamDay()
+onMounted(()=>{
+ init()
+ window.addEventListener('focus',checkReconnect)
+ window.addEventListener('online',checkReconnect)
+ document.addEventListener('visibilitychange',checkReconnect)
+ // An open browser can cross midnight without a focus/visibility event.
+ dayWatcher=setInterval(()=>{
+  const day=localVietnamDay()
+  if(day!==observedDay){observedDay=day;checkReconnect()}
+ },60000)
+})
 onUnmounted(()=>{
+ if(dayWatcher)clearInterval(dayWatcher)
  authSubscription?.unsubscribe()
  closeChannel(channel);closeChannel(memberChannel)
  if(liveTimer)clearTimeout(liveTimer)
