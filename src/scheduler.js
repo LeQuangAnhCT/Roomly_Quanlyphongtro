@@ -11,7 +11,15 @@ export function mondayOf(date) {
   return d.toISOString().slice(0, 10)
 }
 const minutes = value => Number(String(value).slice(0, 2)) * 60 + Number(String(value).slice(3, 5))
+export function isAnytime(chore) {
+  return chore?.time_mode === 'anytime' ||
+    (chore?.time_mode == null && (
+      ['wash','dry','water'].includes(String(chore?.icon || '').toLowerCase()) ||
+      /giặt|phơi|quét|lau nhà|chùi nhà|dọn nhà|đổi nước/i.test(String(chore?.name || ''))
+    ))
+}
 export function overlap(a, b) {
+  if (isAnytime(a) || isAnytime(b)) return false
   const s = minutes(a.start_time), t = minutes(b.start_time)
   return s < t + Number(b.duration_minutes) && t < s + Number(a.duration_minutes)
 }
@@ -37,8 +45,10 @@ export function isBusy({userId, date, weekday, chore, busySlots = [], availabili
   if (availability.some(v => v.user_id === userId && Number(v.weekday) === weekday && v.available === false)) return true
   return busySlots.some(slot => slot.user_id === userId &&
     (slot.busy_date === date || (slot.busy_date == null && Number(slot.weekday) === weekday)) &&
-    minutes(slot.starts_at) < minutes(chore.start_time) + Number(chore.duration_minutes) &&
-    minutes(chore.start_time) < minutes(slot.ends_at))
+    (isAnytime(chore)
+      ? minutes(slot.starts_at) <= 0 && minutes(slot.ends_at) >= 23 * 60 + 59
+      : minutes(slot.starts_at) < minutes(chore.start_time) + Number(chore.duration_minutes) &&
+        minutes(chore.start_time) < minutes(slot.ends_at)))
 }
 /**
  * Each member must receive a turn in a category before anyone can receive
@@ -66,11 +76,19 @@ export function generateWeek({members, chores, availability = [], busySlots = []
     .slice().sort((a, b) => String(a.work_date).localeCompare(String(b.work_date)) ||
       String(choreById.get(a.chore_id)?.start_time || '').localeCompare(String(choreById.get(b.chore_id)?.start_time || '')) ||
       String(a.id || '').localeCompare(String(b.id || '')))
+  const countedLaundryLegacy = new Set()
   for (const a of historical) {
     if (!loads.has(a.assignee_id)) continue
     const c = choreById.get(a.chore_id)
     if (!c) continue
     const category = choreCategory(c)
+    // The old database stored washing and drying as two tasks in a day.
+    // Count the combined duty once when reconstructing historical rounds.
+    if (category === 'laundry') {
+      const once = a.work_date + ':' + a.assignee_id
+      if (countedLaundryLegacy.has(once)) continue
+      countedLaundryLegacy.add(once)
+    }
     const counts = categoryCounts(category)
     counts.set(a.assignee_id, (counts.get(a.assignee_id) || 0) + 1)
     const k = category + ':' + a.assignee_id
