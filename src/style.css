@@ -47,3 +47,25 @@
 .task-card .state.done{display:inline-flex;align-items:center;justify-content:center;min-width:32px;min-height:30px;padding:5px 7px;border-radius:999px;background:#1c7c48;color:#fff}
 .task-card .state.done svg{display:block;flex-shrink:0}
 .task-name .carryover-label{color:#ab6625;font-size:10px;font-weight:700}
+
+/* Inline active/pause control on each chore card. Mobile-friendly, no modal. */
+.chore-card-actions{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto}
+.chore-card-actions .icon-button{margin-left:0}
+.chore-active-toggle,.chore-status-readonly{
+ display:inline-flex;align-items:center;justify-content:center;gap:6px;
+ min-height:34px;border:1px solid #dddddd;background:#f7f7f7;color:#666;
+ border-radius:9px;padding:7px 10px;white-space:nowrap;
+ font:inherit;font-weight:650;font-size:11px;line-height:1;
+}
+.chore-active-toggle{cursor:pointer;transition:background .15s,border-color .15s}
+.chore-active-toggle.enabled,.chore-status-readonly.enabled{
+ background:#edf7f0;border-color:#c4e1cd;color:#247347
+}
+.chore-active-toggle:disabled{opacity:.6;cursor:wait}
+.chore-active-toggle:focus-visible{outline:2px solid #111;outline-offset:2px}
+.chore-toggle-dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+@media(max-width:410px){
+ .chore-card{gap:9px;padding:11px}
+ .chore-card-actions{gap:5px}
+ .chore-active-toggle,.chore-status-readonly{padding:7px;min-height:32px;font-size:10px}
+}

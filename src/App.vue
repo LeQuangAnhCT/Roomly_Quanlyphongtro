@@ -184,6 +184,22 @@ async function leaveRoom(){if(!confirm('Bạn muốn rời nhóm trọ?'))return
 function openChore(chore=null){draft.value=chore?{...chore,weekdays:[...chore.weekdays],time_mode:chore.time_mode||(isAnytime(chore)?'anytime':'timed')}:{name:'',icon:'sparkles',time_mode:'anytime',weight:1,start_time:'09:00',duration_minutes:30,weekdays:[1,2,3,4,5,6,7],enabled:true};modal.value='chore'}
 function onChoreIconChange(){if(['lunch','dinner','dishes_lunch','dishes_dinner'].includes(draft.value.icon)){draft.value.time_mode='timed'}else if(['wash','dry','water'].includes(draft.value.icon)){draft.value.time_mode='anytime'}}
 async function saveChore(){await run(async()=>{const d=draft.value;const values={room_id:room.value.id,name:d.name?.trim(),icon:d.icon||'sparkles',weight:Number(d.weight),time_mode:d.time_mode||'anytime',start_time:d.start_time||'09:00',duration_minutes:Number(d.duration_minutes||30),weekdays:d.weekdays,enabled:Boolean(d.enabled)};if(!values.name||!values.weekdays.length)throw Error('Nhập tên việc và chọn ít nhất một ngày');if(d.id)await check(await supabase.from('chores').update(values).eq('id',d.id));else await check(await supabase.from('chores').insert(values));modal.value='';await refresh();toast('Đã lưu công việc')})}
+async function toggleChoreEnabled(chore){
+ if(!isOwner.value||busy.value)return
+ const next=!chore.enabled
+ const previous=chore.enabled
+ // Update this card immediately without remounting the current tab.
+ chore.enabled=next
+ await run(async()=>{
+  try{
+   const saved=await check(await supabase.from('chores')
+    .update({enabled:next}).eq('id',chore.id).eq('room_id',room.value.id)
+    .select('id,enabled').single())
+   chore.enabled=saved.enabled
+   toast(next?'Đã bật công việc':'Đã tạm dừng công việc')
+  }catch(e){chore.enabled=previous;throw e}
+ })
+}
 async function deleteChore(id){if(!confirm('Xóa công việc này và các lịch liên quan?'))return;await run(async()=>{await check(await supabase.from('chores').delete().eq('id',id));modal.value='';await refresh();toast('Đã xóa công việc')})}
 function toggleWeekday(d){draft.value.weekdays=draft.value.weekdays.includes(d)?draft.value.weekdays.filter(x=>x!==d):[...draft.value.weekdays,d].sort()}
 function moveWeek(n){weekStart.value=dateAt(weekStart.value,n*7);selectedDay.value=weekStart.value;refresh().catch(e=>toast(localErr(e),true))}
@@ -384,7 +400,7 @@ onUnmounted(()=>{
   <div v-for="b in busySlots.filter(x=>x.user_id!==user.id)" :key="b.id" class="busy-row"><div class="busy-row-info"><b>{{nameOf(b.user_id)}} · {{b.reason}}</b><small>{{b.busy_date?formatBusy(b):'Mỗi '+formatBusy(b)}} · {{formatClock(b.starts_at)}}–{{formatClock(b.ends_at)}}</small></div></div>
   <div v-if="!busySlots.some(x=>x.user_id!==user.id)" class="busy-empty">Chưa có lịch bận từ thành viên khác.</div>
  </div><button v-if="!isOwner" class="btn btn-outline leave" @click="leaveRoom">Rời nhóm trọ</button></section>
-   <section v-else-if="currentTab==='chores'" key="chores" class="content-panel"><div class="title-line"><div><span class="eyebrow">CÔNG VIỆC ĐỊNH KỲ</span><h1>Danh mục việc</h1><p>Thiết lập việc nhà và lịch lặp mỗi tuần.</p></div><button v-if="isOwner" class="icon-button primary-icon" title="Thêm công việc" @click="openChore()"><Plus :size="21"/></button></div><div v-for="c in chores" :key="c.id" class="chore-card"><div class="task-icon"><component :is="iconFor[c.icon]||ListTodo" :size="20"/></div><div class="chore-info"><b>{{c.name}}</b><small>{{choreTimeLabel(c)}} · {{c.weekdays.length}} ngày/tuần</small><span>{{c.weight}} điểm · {{c.enabled?'Đang áp dụng':'Tạm dừng'}}</span></div><button v-if="isOwner" class="icon-button" @click="openChore(c)" title="Sửa công việc"><Pencil :size="17"/></button></div><div class="notice"><AlertCircle :size="17"/><span>Điểm công việc dùng để chia công sức công bằng, không phải tiền lương.</span></div></section>
+   <section v-else-if="currentTab==='chores'" key="chores" class="content-panel"><div class="title-line"><div><span class="eyebrow">CÔNG VIỆC ĐỊNH KỲ</span><h1>Danh mục việc</h1><p>Thiết lập việc nhà và lịch lặp mỗi tuần.</p></div><button v-if="isOwner" class="icon-button primary-icon" title="Thêm công việc" @click="openChore()"><Plus :size="21"/></button></div><div v-for="c in chores" :key="c.id" class="chore-card"><div class="task-icon"><component :is="iconFor[c.icon]||ListTodo" :size="20"/></div><div class="chore-info"><b>{{c.name}}</b><small>{{choreTimeLabel(c)}} · {{c.weekdays.length}} ngày/tuần</small><span>{{c.weight}} điểm</span></div><div v-if="isOwner" class="chore-card-actions"><button type="button" class="chore-active-toggle" :class="{enabled:c.enabled}" :disabled="busy" :aria-pressed="c.enabled" :aria-label="c.enabled?'Tạm dừng '+c.name:'Bật hoạt động '+c.name" :title="c.enabled?'Nhấn để tạm dừng công việc':'Nhấn để bật công việc'" @click="toggleChoreEnabled(c)"><span class="chore-toggle-dot"></span>{{c.enabled?'Hoạt động':'Tạm dừng'}}</button><button class="icon-button" @click="openChore(c)" title="Sửa công việc" :aria-label="'Sửa '+c.name"><Pencil :size="17"/></button></div><span v-else class="chore-status-readonly" :class="{enabled:c.enabled}">{{c.enabled?'Hoạt động':'Tạm dừng'}}</span></div><div class="notice"><AlertCircle :size="17"/><span>Điểm công việc dùng để chia công sức công bằng, không phải tiền lương.</span></div></section>
    <section v-else-if="currentTab==='stats'" key="stats" class="content-panel"><div class="title-line"><div><span class="eyebrow">MINH BẠCH & CÔNG BẰNG</span><h1>Thống kê</h1><p>Tổng hợp tuần bắt đầu {{weekStart.slice(8)}}/{{weekStart.slice(5,7)}}.</p></div></div><div class="surface"><h3>Điểm công việc theo người</h3><div v-for="s in stats" :key="s.user_id" class="stat-person"><div class="stat-caption"><span>{{nameOf(s.user_id)}}</span><b>{{s.points}} điểm</b></div><div class="stat-bar"><div :style="{width:100*s.points/Math.max(...stats.map(x=>x.points),1)+'%'}"></div></div><small>{{s.done}}/{{s.assigned}} việc hoàn thành</small></div></div><div class="surface debt-section">
  <div class="section-title"><div><h3>Sổ nợ công việc</h3><small>Chỉ được thanh toán nợ bằng một việc bù riêng đã hoàn thành.</small></div><span class="state">{{owedDebts.length}} khoản nợ</span></div>
  <div v-if="!owedDebts.length" class="busy-empty">Chưa có ai nợ việc trong nhóm.</div>
