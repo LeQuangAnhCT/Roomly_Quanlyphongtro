@@ -24,6 +24,13 @@ const unread=computed(()=>notifications.value.filter(n=>!n.read_at).length)
 const myBusy=computed(()=>busySlots.value.filter(b=>b.user_id===user.value?.id).sort((a,b)=>String(a.busy_date||a.weekday).localeCompare(String(b.busy_date||b.weekday))||a.starts_at.localeCompare(b.starts_at)))
 const owedDebts=computed(()=>debts.value.filter(d=>d.status==='owed'))
 const myDebts=computed(()=>owedDebts.value.filter(d=>d.user_id===user.value?.id))
+const conflictedTasks=computed(()=>assignments.value.filter(a=>{
+ if(a.assignee_id!==user.value?.id||a.status!=='pending')return false
+ const c=choreOf(a.chore_id)
+ if(!c)return false
+ const wd=(new Date(a.work_date+'T00:00:00Z').getUTCDay()+6)%7+1
+ return isBusy({userId:user.value.id,date:a.work_date,weekday:wd,chore:c,busySlots:busySlots.value,availability:availability.value})
+}))
 const formatBusy=b=>b.busy_date ? b.busy_date.split('-').reverse().join('/') : weekdays[Number(b.weekday)-1]
 function canTakeTransfer(personId,assignment) {
  const c=choreOf(assignment.chore_id)
@@ -135,6 +142,7 @@ async function complete(a){await run(async()=>{await check(await supabase.rpc('r
 function openSwap(a){activeAssignment.value=a;newRecipient.value='';debtReason.value='';modal.value='swap'}
 async function requestSwap(){await run(async()=>{if(!newRecipient.value||!canTakeTransfer(newRecipient.value,activeAssignment.value))throw Error('Chọn thành viên rảnh và không trùng giờ');await check(await supabase.from('swap_requests').insert({room_id:room.value.id,assignment_id:activeAssignment.value.id,from_user:user.value.id,to_user:newRecipient.value}));modal.value='';await refresh();toast('Đã gửi yêu cầu đổi việc')})}
 async function decideSwap(s,accept){await run(async()=>{await check(await supabase.rpc('room_resolve_swap',{p_id:s.id,p_accept:accept}));await refresh();toast(accept?'Đã nhận việc':'Đã từ chối')})}
+function busyPreset(start,end){busyDraft.value={...busyDraft.value,starts_at:start,ends_at:end}}
 function openBusy(){
  busyDraft.value={mode:'weekly',weekday:1,busy_date:selectedDay.value,starts_at:'07:00',ends_at:'12:00',reason:'Đi học'}
  modal.value='busy'
@@ -170,7 +178,7 @@ async function markDebt(){
  })
 }
 function openMakeup(debt){
- debtDraft.value={debt_id:debt.id,chore_id:chores.value.find(c=>c.enabled)?.id||'',work_date:dateAt(weekStart.value,7)}
+ debtDraft.value={debt_id:debt.id,weight:debt.weight,chore_id:chores.value.find(c=>c.enabled&&Number(c.weight)>=Number(debt.weight))?.id||'',work_date:dateAt(weekStart.value,7)}
  modal.value='makeup'
 }
 async function scheduleMakeup(){
@@ -204,7 +212,7 @@ onMounted(init);onUnmounted(()=>{authSubscription?.unsubscribe();if(channel&&sup
     <div class="surface week-panel"><div class="section-title"><strong>Tuần {{weekStart.slice(8)}}/{{weekStart.slice(5,7)}} – {{dateAt(weekStart,6).slice(8)}}/{{dateAt(weekStart,6).slice(5,7)}}</strong><div class="week-arrows"><button @click="moveWeek(-1)"><ChevronLeft :size="18"/></button><button @click="moveWeek(1)"><ChevronRight :size="18"/></button></div></div><div class="week-days"><button v-for="day in weekDays" :key="day.date" :class="{'is-active':selectedDay===day.date}" @click="selectedDay=day.date"><span>{{day.label}}</span><b>{{day.num}}</b><i></i></button></div></div>
     <div class="section-title after-week"><div><h2>{{weekDays.find(d=>d.date===selectedDay)?.label}}, {{selectedDay.slice(8,10)}}/{{selectedDay.slice(5,7)}}</h2><small>{{selectedAssignments.length}} công việc</small></div><select v-model="filter" aria-label="Lọc nhân viên"><option value="all">Tất cả</option><option v-for="m in members" :key="m.user_id" :value="m.user_id">{{nameOf(m.user_id)}}</option></select></div>
     <div v-if="!selectedAssignments.length" class="empty"><CalendarDays :size="30"/><b>Chưa có việc trong ngày</b><p>Trưởng nhóm có thể tạo lịch tự động để phân việc.</p></div>
-    <div v-for="a in selectedAssignments" :key="a.id" class="task-card"><div class="task-top"><div class="task-icon"><component :is="iconFor[choreOf(a.chore_id)?.icon]||ListTodo" :size="20"/></div><div class="task-name"><b>{{choreOf(a.chore_id)?.name||'Công việc'}}</b><small><Clock3 :size="13"/> {{formatClock(choreOf(a.chore_id)?.start_time)}} · {{choreOf(a.chore_id)?.duration_minutes}} phút</small></div><span class="state" :class="a.status">{{a.status==='done'?'Đã xong':a.status==='skipped'?'Nợ việc':'Chưa làm'}}</span></div><div class="task-bottom"><span class="person-pill"><span class="mini-avatar">{{initials(a.assignee_id)}}</span> {{nameOf(a.assignee_id)}}</span><span v-if="a.makeup_debt_id" class="state">Việc bù nợ</span><div class="task-actions"><button v-if="a.assignee_id===user.id&&a.status!=='skipped'" class="small-button" :disabled="busy" @click="complete(a)"><Check :size="14"/> {{a.status==='done'?'Hoàn tác':'Hoàn thành'}}</button><button v-if="a.assignee_id===user.id&&a.status==='pending'" class="small-button" @click="openSwap(a)"><ArrowRightLeft :size="14"/> Đổi</button></div></div></div>
+    <div v-for="a in selectedAssignments" :key="a.id" class="task-card"><div class="task-top"><div class="task-icon"><component :is="iconFor[choreOf(a.chore_id)?.icon]||ListTodo" :size="20"/></div><div class="task-name"><b>{{choreOf(a.chore_id)?.name||'Công việc'}}</b><small><Clock3 :size="13"/> {{formatClock(choreOf(a.chore_id)?.start_time)}} · {{choreOf(a.chore_id)?.duration_minutes}} phút</small></div><span class="state" :class="a.status">{{a.status==='done'?'Đã xong':a.status==='skipped'?'Nợ việc':'Chưa làm'}}</span></div><div class="task-bottom"><span class="person-pill"><span class="mini-avatar">{{initials(a.assignee_id)}}</span> {{nameOf(a.assignee_id)}}</span><span v-if="a.makeup_debt_id" class="state">Việc bù nợ</span><div class="task-actions"><button v-if="a.assignee_id===user.id&&a.status!=='skipped'" class="small-button" :disabled="busy" @click="complete(a)"><Check :size="14"/> {{a.status==='done'?'Hoàn tác':'Hoàn thành'}}</button><button v-if="a.assignee_id===user.id&&a.status==='pending'&&!a.makeup_debt_id" class="small-button" @click="openSwap(a)"><ArrowRightLeft :size="14"/> Đổi</button></div></div></div>
     <div v-if="isOwner" class="actions-sticky"><button class="btn btn-outline" @click="manualChore='';manualPerson='';modal='manual'"><Plus :size="17"/> Phân công thủ công</button><button class="btn btn-dark" :disabled="busy" @click="autoSchedule"><Shuffle :size="17"/> Tự động phân lịch tuần</button></div>
    </section>
    <section v-else-if="currentTab==='members'" key="members" class="content-panel"><div class="title-line"><div><span class="eyebrow">KHÔNG GIAN SỐNG CHUNG</span><h1>Nhóm trọ</h1><p>Quản lý {{members.length}} thành viên trong nhóm.</p></div></div><div class="surface invite-card"><div><small>MÃ MỜI THÀNH VIÊN</small><strong>{{room.invite_code}}</strong></div><button class="btn btn-outline" @click="copyCode"><Copy :size="16"/> Sao chép</button></div><h2 class="subheading">Thành viên</h2><div v-for="m in members" :key="m.user_id" class="member-card"><span class="member-avatar">{{initials(m.user_id)}}</span><div class="member-info"><b>{{nameOf(m.user_id)}}</b><small>{{m.user_id===room.owner_id?'Trưởng nhóm':'Thành viên'}} · {{stats.find(x=>x.user_id===m.user_id)?.assigned||0}} lượt việc</small></div><button v-if="isOwner&&m.user_id!==user.id" class="icon-button danger" title="Xóa thành viên" @click="removeMember(m.user_id)"><Trash2 :size="18"/></button></div><div class="surface availability-card">
@@ -212,6 +220,14 @@ onMounted(init);onUnmounted(()=>{authSubscription?.unsubscribe();if(channel&&sup
  <label>Ngày có thể nhận việc</label>
  <div class="day-options"><button v-for="(label,i) in weekdays" :key="i" :class="{selected:availability.find(a=>a.user_id===user.id&&a.weekday===i+1)?.available!==false}" @click="toggleAvailability(i+1)">{{label}}</button></div>
  <div class="busy-explainer">Ngày được bật: có thể nhận việc ngoài khoảng giờ bận. Ngày tắt: không được phân việc cả ngày.</div>
+ <div v-if="conflictedTasks.length" class="busy-conflict-panel">
+  <b><AlertCircle :size="16"/> Có {{conflictedTasks.length}} công việc trùng với lịch bận</b>
+  <p>Hãy chuyển việc cho người rảnh, hoặc ghi nợ khi không ai nhận.</p>
+  <div v-for="a in conflictedTasks" :key="a.id" class="busy-conflict-row">
+   <small>{{a.work_date.split('-').reverse().join('/')}} · {{choreOf(a.chore_id)?.name}}</small>
+   <button class="btn btn-outline" @click="openSwap(a)">Xử lý</button>
+  </div>
+ </div>
  <div v-if="!myBusy.length" class="busy-empty">Bạn chưa khai báo khung giờ bận cụ thể.</div>
  <div v-for="b in myBusy" :key="b.id" class="busy-row">
   <div class="busy-row-info"><b>{{b.reason}}</b><small>{{b.busy_date?'Ngày '+formatBusy(b):'Hằng tuần · '+formatBusy(b)}} · {{formatClock(b.starts_at)}} – {{formatClock(b.ends_at)}}</small></div>
@@ -255,13 +271,15 @@ onMounted(init);onUnmounted(()=>{authSubscription?.unsubscribe();if(channel&&sup
  <label>Loại lịch</label><select v-model="busyDraft.mode"><option value="weekly">Lặp mỗi tuần</option><option value="date">Một ngày cụ thể</option></select>
  <template v-if="busyDraft.mode==='weekly'"><label>Thứ trong tuần</label><select v-model.number="busyDraft.weekday"><option v-for="(day,i) in weekdays" :value="i+1" :key="i">{{day}}</option></select></template>
  <template v-else><label>Ngày bận</label><input type="date" v-model="busyDraft.busy_date"/></template>
+ <label>Chọn nhanh buổi bận</label>
+ <div class="busy-presets"><button type="button" @click="busyPreset('07:00','12:00')">Buổi sáng</button><button type="button" @click="busyPreset('12:00','17:00')">Buổi chiều</button><button type="button" @click="busyPreset('17:00','22:00')">Buổi tối</button><button type="button" @click="busyPreset('00:00','23:59')">Cả ngày</button></div>
  <div class="form-two"><div><label>Từ giờ</label><input type="time" v-model="busyDraft.starts_at"/></div><div><label>Đến giờ</label><input type="time" v-model="busyDraft.ends_at"/></div></div>
  <label>Lý do</label><select v-model="busyDraft.reason"><option>Đi học</option><option>Đi làm</option><option>Việc riêng</option><option>Không ở trọ</option><option>Đã có lịch khác</option></select>
  <button class="btn btn-dark" :disabled="busy" @click="saveBusy">Lưu lịch bận</button>
  </template>
  <template v-else-if="modal==='makeup'">
- <p>Giao cho người đang nợ một việc bổ sung vào ngày rảnh. Công việc phải chưa có ai phụ trách vào ngày chọn.</p>
- <label>Việc dùng để bù</label><select v-model="debtDraft.chore_id"><option v-for="c in chores.filter(c=>c.enabled)" :key="c.id" :value="c.id">{{c.name}} · {{c.weight}} điểm</option></select>
+ <p>Giao cho người đang nợ một việc bổ sung vào ngày rảnh, ít nhất {{debtDraft.weight}} điểm. Chỉ xóa nợ sau khi hoàn thành.</p>
+ <label>Việc dùng để bù</label><select v-model="debtDraft.chore_id"><option v-for="c in chores.filter(c=>c.enabled&&Number(c.weight)>=Number(debtDraft.weight))" :key="c.id" :value="c.id">{{c.name}} · {{c.weight}} điểm</option></select>
  <label>Ngày bù</label><input type="date" v-model="debtDraft.work_date"/>
  <button class="btn btn-dark" :disabled="busy" @click="scheduleMakeup">Lưu lịch bù</button>
  </template><template v-else-if="modal==='manual'"><p>Phân công việc ngày {{selectedDay.slice(8)}}/{{selectedDay.slice(5,7)}}. Hệ thống sẽ kiểm tra ngày rảnh và trùng giờ.</p><label>Công việc</label><select v-model="manualChore"><option value="">Chọn công việc</option><option v-for="c in chores.filter(x=>x.enabled)" :key="c.id" :value="c.id">{{c.name}} · {{formatClock(c.start_time)}}</option></select><label>Người thực hiện</label><select v-model="manualPerson"><option value="">Chọn thành viên</option><option v-for="m in members" :key="m.user_id" :value="m.user_id">{{nameOf(m.user_id)}}</option></select><button class="btn btn-dark" :disabled="busy" @click="saveManual">Lưu phân công</button></template><template v-else-if="modal==='rename'"><label>Tên nhóm</label><input v-model="roomDraft" maxlength="80"/><button class="btn btn-dark" :disabled="busy" @click="renameRoom">Lưu tên nhóm</button></template><template v-else-if="modal==='profile'"><label>Tên hiển thị</label><input v-model="draftName" maxlength="60"/><button class="btn btn-dark" :disabled="busy" @click="saveProfile">Lưu thay đổi</button></template><template v-else-if="modal==='warnings'"><p v-for="(w,i) in warnings" :key="i">{{w}}</p><button class="btn btn-dark" @click="modal=''">Đã hiểu</button></template></div></div></Transition>
