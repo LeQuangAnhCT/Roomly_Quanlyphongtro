@@ -7,3 +7,25 @@
 .email-login{display:grid;gap:10px;width:min(100%,350px);margin-top:0}.email-login label{font-size:11px;font-weight:700;color:#666}.email-login-row{display:flex;gap:8px;min-width:0}.email-login-row input{flex:1;min-width:0}.email-login-row button{white-space:nowrap;padding:10px 13px}.email-login p{color:#377447!important;font-size:11px!important}
 
 .login-error{background:#fff4f2;color:#9e2820;border:1px solid #f2d1cc;border-radius:10px;padding:10px 12px;font-size:12px;line-height:1.5;margin:10px 0;}
+
+
+/* Room timetable and debt ledger; scoped away from the fixed navigation shell. */
+.availability-card .section-title{align-items:flex-start;flex-wrap:wrap;margin-bottom:13px}
+.availability-card .section-title .btn{min-height:35px;padding:8px 10px}
+.availability-card>label{font-size:11px;color:#777;display:block;margin-bottom:8px}
+.availability-card .day-options{margin-bottom:10px}
+.busy-explainer,.busy-empty{color:#7a7a7a;font-size:11px;line-height:1.55;margin:10px 0}
+.busy-row,.debt-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 0;border-top:1px solid #eee;min-width:0}
+.busy-row-info,.debt-row>div{min-width:0;display:grid;gap:5px}
+.busy-row-info b,.debt-row b{font-size:12px;overflow-wrap:anywhere}
+.busy-row-info small,.debt-row small{font-size:11px;color:#7d7d7d;line-height:1.4;overflow-wrap:anywhere}
+.busy-row .icon-button{min-width:34px}
+.debt-section{margin-bottom:15px}
+.debt-section .section-title{margin-bottom:12px}
+.debt-row .btn{flex:none;min-height:33px;padding:8px 11px;font-size:11px}
+.debt-divider{text-align:center;font-size:10px;font-weight:700;letter-spacing:1px;color:#999;padding:12px 0;border-top:1px solid #eee;margin-top:8px}
+.modal-card .busy-explainer{margin:0 0 8px}
+@media(max-width:500px){
+ .availability-card .section-title .btn{width:100%}
+ .debt-row{align-items:flex-start}
+}
