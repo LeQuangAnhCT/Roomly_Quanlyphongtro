@@ -3,6 +3,7 @@ import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
 import {House,CalendarDays,UsersRound,ListTodo,BarChart3,Settings,LogOut,Bell,Plus,ChevronLeft,ChevronRight,ChevronDown,Check,CheckCircle2,Clock3,Utensils,Sun,Shirt,Droplets,Shuffle,Trash2,Pencil,Copy,X,RefreshCw,ArrowRightLeft,Menu,AlertCircle,ShieldCheck,LoaderCircle,Download,Smartphone,Share2} from 'lucide-vue-next'
 import {supabase,configured,check} from './supabase.js'
 import {generateWeek,mondayOf,dateAt,isBusy,overlap,isAnytime} from './scheduler.js'
+import {createSyncController,ROOM_TOPICS,topicsForTable} from './syncController.js'
 const iconFor={lunch:Utensils,dinner:Utensils,dishes_lunch:Utensils,dishes_dinner:Utensils,wash:Shirt,dry:Sun,water:Droplets}
 const user=ref(null),booting=ref(true),roomStatus=ref('loading'),roomLoadError=ref(''),busy=ref(false),message=ref(''),error=ref(''),loginEmail=ref(''),emailSent=ref(false),installPrompt=ref(null),appInstalled=ref(false)
 const currentTab=ref('schedule'),modal=ref(''),menuOpen=ref(false),room=ref(null),members=ref([]),chores=ref([]),assignments=ref([]),availability=ref([]),busySlots=ref([]),debts=ref([]),swaps=ref([]),notifications=ref([]),profiles=ref([])
@@ -95,15 +96,20 @@ async function init(){
  if(!configured){booting.value=false;return}
  // Never issue Supabase queries inside the synchronous auth-state callback.
  // Deferring also prevents OAuth initialization and getSession from double-loading.
- authSubscription=supabase.auth.onAuthStateChange((_event,session)=>{
+ authSubscription=supabase.auth.onAuthStateChange((event,session)=>{
   const next=session?.user||null
-  const changed=next?.id!==user.value?.id
-  user.value=next
-  if(changed){
-   const revision=++sessionRevision
-   reset()
-   if(next)setTimeout(()=>{if(revision===sessionRevision)loadEverything()},0)
+  const previousId=user.value?.id||null
+  const nextId=next?.id||null
+  // Supabase can re-emit SIGNED_IN on tab focus, and refresh JWTs silently.
+  // Neither event means that the account or room changed.
+  if(nextId===previousId){
+   if(event==='USER_UPDATED'&&next)user.value=next
+   return
   }
+  user.value=next
+  const revision=++sessionRevision
+  reset()
+  if(next)setTimeout(()=>{if(revision===sessionRevision)loadEverything()},0)
  }).data.subscription
  try{
   const {data,error:sessionError}=await supabase.auth.getSession()
@@ -188,42 +194,75 @@ async function maybeRolloverDishes(roomId){
  lastRolloverCheck=key
  if(Number(data)>0)toast('Đã tự chuyển '+data+' lượt rửa chén chưa làm sang buổi trưa.')
 }
-let refreshInFlight=null,refreshAgain=false
-async function refresh(){
- if(!room.value||!user.value)return
- // Coalesce overlapping action and realtime updates into one network batch.
- if(refreshInFlight){refreshAgain=true;return refreshInFlight}
- const id=room.value.id,accountId=user.value.id
- const job=(async()=>{
- const results=await Promise.all([
- supabase.from('room_members').select('*').eq('room_id',id).eq('active',true),
- supabase.from('chores').select('*').eq('room_id',id).order('start_time'),
- supabase.from('assignments').select('*').eq('room_id',id).lte('work_date',dateAt(weekStart.value,6)).order('work_date'),
- supabase.from('member_availability').select('*').eq('room_id',id),
- supabase.from('room_busy_slots').select('*').eq('room_id',id).order('starts_at'),
- supabase.from('room_work_debts').select('*').eq('room_id',id).order('created_at',{ascending:false}),
- supabase.from('swap_requests').select('*').eq('room_id',id).order('created_at',{ascending:false}),
- supabase.from('room_notifications').select('*').eq('user_id',user.value.id).order('created_at',{ascending:false}).limit(50)
- ]);const [m,c,a,v,b,d,s,n]=await Promise.all(results.map(check))
- const people=m.length?await check(await supabase.from('room_profiles').select('user_id,display_name,avatar_url').in('user_id',m.map(x=>x.user_id))):[]
- if(room.value?.id!==id||user.value?.id!==accountId)return
- members.value=m;chores.value=c;assignments.value=a;availability.value=v;busySlots.value=b;debts.value=d;swaps.value=s;notifications.value=n;profiles.value=people
- })()
- refreshInFlight=job
- try{await job}
- finally{
-  refreshInFlight=null
-  if(refreshAgain){refreshAgain=false;queueLiveRefresh(false)}
+// Scoped data service: each Realtime event fetches only its affected table.
+// Reads may overlap in the network but are serialized by the coordinator, and
+// a stale response cannot mutate state after logout or room/week change.
+let lastDataSyncAt=0
+const dataFetchers={
+ room_members:id=>supabase.from('room_members').select('*').eq('room_id',id).eq('active',true),
+ chores:id=>supabase.from('chores').select('*').eq('room_id',id).order('start_time'),
+ assignments:id=>supabase.from('assignments').select('*').eq('room_id',id).lte('work_date',dateAt(weekStart.value,6)).order('work_date'),
+ member_availability:id=>supabase.from('member_availability').select('*').eq('room_id',id),
+ room_busy_slots:id=>supabase.from('room_busy_slots').select('*').eq('room_id',id).order('starts_at'),
+ room_work_debts:id=>supabase.from('room_work_debts').select('*').eq('room_id',id).order('created_at',{ascending:false}),
+ swap_requests:id=>supabase.from('swap_requests').select('*').eq('room_id',id).order('created_at',{ascending:false}),
+ room_notifications:(_id,uid)=>supabase.from('room_notifications').select('*').eq('user_id',uid).order('created_at',{ascending:false}).limit(50)
+}
+const dataRefs={
+ room_members:members,chores,assignments,member_availability:availability,
+ room_busy_slots:busySlots,room_work_debts:debts,swap_requests:swaps,
+ room_notifications:notifications,room_profiles:profiles
+}
+async function fetchChangedData(topics){
+ const id=room.value?.id,uid=user.value?.id,rev=sessionRevision
+ if(!id||!uid)return
+ const start=weekStart.value
+ const wanted=new Set(topics.includes('all')?ROOM_TOPICS:topics)
+ if(!wanted.size)return
+ const keys=[...wanted].filter(name=>name!=='room_profiles'&&dataFetchers[name])
+ const results=await Promise.all(keys.map(async name=>
+  [name,await check(await dataFetchers[name](id,uid))]
+ ))
+ const next=Object.fromEntries(results)
+ if(wanted.has('room_members')||wanted.has('room_profiles')){
+  const group=next.room_members||members.value
+  const ids=group.map(m=>m.user_id)
+  next.room_profiles=ids.length
+   ?await check(await supabase.from('room_profiles').select('user_id,display_name,avatar_url').in('user_id',ids))
+   :[]
  }
+ // Reject stale account/room reads. Week navigation only invalidates the
+ // assignment slice, not every independently fetched profile/notification.
+ if(sessionRevision!==rev||room.value?.id!==id||user.value?.id!==uid)return
+ for(const [topic,rows] of Object.entries(next)){
+  if(topic==='assignments'&&start!==weekStart.value){
+   // Schedule only the new week rather than applying the previous-week result.
+   void syncQueue.request(['assignments']).catch(()=>{})
+   continue
+  }
+  if(dataRefs[topic])dataRefs[topic].value=rows
+ }
+ lastDataSyncAt=Date.now()
+ // If this authenticated user disappeared from the member list, verify their
+ // own membership on the server. Other members leaving only change their list.
+ if(next.room_members&&!next.room_members.some(m=>m.user_id===uid))
+  void loadEverything({silent:true})
+}
+const syncQueue=createSyncController({
+ execute:fetchChangedData,
+ onError:e=>{console.warn('Roomly data synchronization failed:',localErr(e))}
+})
+async function refresh(topics=['all']){
+ return syncQueue.request(topics,{immediate:true})
 }
 async function createRoom(){await run(async()=>{if(!groupName.value.trim())throw Error('Nhập tên nhóm trọ');await check(await supabase.rpc('room_create',{p_name:groupName.value.trim()}));groupName.value='';await loadEverything();toast('Đã tạo nhóm trọ')})}
 async function joinRoom(){await run(async()=>{if(!joinCode.value.trim())throw Error('Nhập mã mời');await check(await supabase.rpc('room_join',{p_code:joinCode.value.trim()}));joinCode.value='';await loadEverything();toast('Đã gia nhập nhóm trọ')})}
 async function copyCode(){try{await navigator.clipboard.writeText(room.value.invite_code);toast('Đã sao chép mã mời')}catch{toast('Mã mời: '+room.value.invite_code)}}
-async function removeMember(id){if(!confirm('Xóa thành viên khỏi nhóm?'))return;await run(async()=>{await check(await supabase.rpc('room_remove_member',{p_room:room.value.id,p_user:id}));await refresh();toast('Đã xóa thành viên')})}
+async function removeMember(id){if(!confirm('Xóa thành viên khỏi nhóm?'))return;await run(async()=>{await check(await supabase.rpc('room_remove_member',{p_room:room.value.id,p_user:id}));await refresh(['room_members','room_profiles','assignments']);toast('Đã xóa thành viên')})}
 async function leaveRoom(){if(!confirm('Bạn muốn rời nhóm trọ?'))return;await run(async()=>{await check(await supabase.rpc('room_leave',{p_room:room.value.id}));reset();toast('Đã rời nhóm trọ')})}
 function openChore(chore=null){draft.value=chore?{...chore,weekdays:[...chore.weekdays],time_mode:chore.time_mode||(isAnytime(chore)?'anytime':'timed')}:{name:'',icon:'sparkles',time_mode:'anytime',weight:1,start_time:'09:00',duration_minutes:30,weekdays:[1,2,3,4,5,6,7],enabled:true};modal.value='chore'}
 function onChoreIconChange(){if(['lunch','dinner','dishes_lunch','dishes_dinner'].includes(draft.value.icon)){draft.value.time_mode='timed'}else if(['wash','dry','water'].includes(draft.value.icon)){draft.value.time_mode='anytime'}}
-async function saveChore(){await run(async()=>{const d=draft.value;const values={room_id:room.value.id,name:d.name?.trim(),icon:d.icon||'sparkles',weight:Number(d.weight),time_mode:d.time_mode||'anytime',start_time:d.start_time||'09:00',duration_minutes:Number(d.duration_minutes||30),weekdays:d.weekdays,enabled:Boolean(d.enabled)};if(!values.name||!values.weekdays.length)throw Error('Nhập tên việc và chọn ít nhất một ngày');if(d.id)await check(await supabase.from('chores').update(values).eq('id',d.id));else await check(await supabase.from('chores').insert(values));modal.value='';await refresh();toast('Đã lưu công việc')})}
+async function saveChore(){await run(async()=>{const d=draft.value;const values={room_id:room.value.id,name:d.name?.trim(),icon:d.icon||'sparkles',weight:Number(d.weight),time_mode:d.time_mode||'anytime',start_time:d.start_time||'09:00',duration_minutes:Number(d.duration_minutes||30),weekdays:d.weekdays,enabled:Boolean(d.enabled)};if(!values.name||!values.weekdays.length)throw Error('Nhập tên việc và chọn ít nhất một ngày');if(d.id)await check(await supabase.from('chores').update(values).eq('id',d.id));else await check(await supabase.from('chores').insert(values));modal.value='';await refresh(['chores']);toast('Đã lưu công việc')})}
 async function toggleChoreEnabled(chore){
  if(!isOwner.value||busy.value)return
  const next=!chore.enabled
@@ -240,17 +279,17 @@ async function toggleChoreEnabled(chore){
   }catch(e){chore.enabled=previous;throw e}
  })
 }
-async function deleteChore(id){if(!confirm('Xóa công việc này và các lịch liên quan?'))return;await run(async()=>{await check(await supabase.from('chores').delete().eq('id',id));modal.value='';await refresh();toast('Đã xóa công việc')})}
+async function deleteChore(id){if(!confirm('Xóa công việc này và các lịch liên quan?'))return;await run(async()=>{await check(await supabase.from('chores').delete().eq('id',id));modal.value='';await refresh(['chores','assignments']);toast('Đã xóa công việc')})}
 function toggleWeekday(d){draft.value.weekdays=draft.value.weekdays.includes(d)?draft.value.weekdays.filter(x=>x!==d):[...draft.value.weekdays,d].sort()}
-function moveWeek(n){weekStart.value=dateAt(weekStart.value,n*7);selectedDay.value=weekStart.value;refresh().catch(e=>toast(localErr(e),true))}
-async function saveManual(){await run(async()=>{if(!manualChore.value||!manualPerson.value)throw Error('Chọn công việc và người thực hiện');await check(await supabase.rpc('room_assign_manual',{p_room:room.value.id,p_chore:manualChore.value,p_date:selectedDay.value,p_user:manualPerson.value}));modal.value='';await refresh();toast('Đã phân công thủ công')})}
+function moveWeek(n){weekStart.value=dateAt(weekStart.value,n*7);selectedDay.value=weekStart.value;refresh(['assignments']).catch(e=>toast(localErr(e),true))}
+async function saveManual(){await run(async()=>{if(!manualChore.value||!manualPerson.value)throw Error('Chọn công việc và người thực hiện');await check(await supabase.rpc('room_assign_manual',{p_room:room.value.id,p_chore:manualChore.value,p_date:selectedDay.value,p_user:manualPerson.value}));modal.value='';await refresh(['assignments']);toast('Đã phân công thủ công')})}
 async function renameRoom(){await run(async()=>{await check(await supabase.rpc('room_rename',{p_room:room.value.id,p_name:roomDraft.value}));room.value={...room.value,name:roomDraft.value.trim()};modal.value='';toast('Đã đổi tên nhóm')})}
 async function disbandRoom(){if(!confirm('Giải tán nhóm sẽ xóa toàn bộ lịch, thành viên và dữ liệu nhóm. Bạn chắc chắn?'))return;await run(async()=>{await check(await supabase.rpc('room_disband',{p_room:room.value.id}));reset();toast('Đã giải tán nhóm')})}
-async function autoSchedule(){if(!isOwner.value)return;const existing=assignments.value.filter(a=>a.work_date<weekStart.value);const future=assignments.value.filter(a=>a.work_date>=weekStart.value&&a.work_date<=dateAt(weekStart.value,6));if(future.some(a=>a.status!=='pending'||a.makeup_debt_id))return toast('Tuần có việc đã hoàn thành, bị nợ hoặc lịch bù nên không thể tạo lại.',true);const result=generateWeek({members:members.value,chores:chores.value,availability:availability.value,busySlots:busySlots.value,history:existing.map(a=>({...a,weight:choreOf(a.chore_id)?.weight||1})),weekStart:weekStart.value});warnings.value=result.warnings; if(!result.rows.length)return toast('Không có việc nào để phân. Kiểm tra ngày rảnh hoặc danh mục việc.',true);if(!confirm(`Phân ${result.rows.length} lượt việc trong tuần? Lịch chưa hoàn thành của tuần này sẽ được tạo lại.`))return;await run(async()=>{await check(await supabase.rpc('room_replace_week',{p_room:room.value.id,p_start:weekStart.value,p_rows:result.rows.map(({room_id,chore_id,work_date,assignee_id})=>({chore_id,work_date,assignee_id}))}));await refresh();toast(`Đã phân ${result.rows.length} công việc`);modal.value=warnings.value.length?'warnings':''})}
-async function complete(a){await run(async()=>{await check(await supabase.rpc('room_complete_assignment',{p_id:a.id,p_done:a.status!=='done'}));await refresh();toast(a.status==='done'?'Đã hoàn tác':'Đã đánh dấu hoàn thành')})}
+async function autoSchedule(){if(!isOwner.value)return;const existing=assignments.value.filter(a=>a.work_date<weekStart.value);const future=assignments.value.filter(a=>a.work_date>=weekStart.value&&a.work_date<=dateAt(weekStart.value,6));if(future.some(a=>a.status!=='pending'||a.makeup_debt_id))return toast('Tuần có việc đã hoàn thành, bị nợ hoặc lịch bù nên không thể tạo lại.',true);const result=generateWeek({members:members.value,chores:chores.value,availability:availability.value,busySlots:busySlots.value,history:existing.map(a=>({...a,weight:choreOf(a.chore_id)?.weight||1})),weekStart:weekStart.value});warnings.value=result.warnings; if(!result.rows.length)return toast('Không có việc nào để phân. Kiểm tra ngày rảnh hoặc danh mục việc.',true);if(!confirm(`Phân ${result.rows.length} lượt việc trong tuần? Lịch chưa hoàn thành của tuần này sẽ được tạo lại.`))return;await run(async()=>{await check(await supabase.rpc('room_replace_week',{p_room:room.value.id,p_start:weekStart.value,p_rows:result.rows.map(({room_id,chore_id,work_date,assignee_id})=>({chore_id,work_date,assignee_id}))}));await refresh(['assignments']);toast(`Đã phân ${result.rows.length} công việc`);modal.value=warnings.value.length?'warnings':''})}
+async function complete(a){await run(async()=>{await check(await supabase.rpc('room_complete_assignment',{p_id:a.id,p_done:a.status!=='done'}));await refresh(['assignments','room_work_debts']);toast(a.status==='done'?'Đã hoàn tác':'Đã đánh dấu hoàn thành')})}
 function openSwap(a){activeAssignment.value=a;newRecipient.value='';debtReason.value='';modal.value='swap'}
-async function requestSwap(){await run(async()=>{if(!newRecipient.value||!canTakeTransfer(newRecipient.value,activeAssignment.value))throw Error('Chọn thành viên rảnh và không trùng giờ');await check(await supabase.from('swap_requests').insert({room_id:room.value.id,assignment_id:activeAssignment.value.id,from_user:user.value.id,to_user:newRecipient.value}));modal.value='';await refresh();toast('Đã gửi yêu cầu đổi việc')})}
-async function decideSwap(s,accept){await run(async()=>{await check(await supabase.rpc('room_resolve_swap',{p_id:s.id,p_accept:accept}));await refresh();toast(accept?'Đã nhận việc':'Đã từ chối')})}
+async function requestSwap(){await run(async()=>{if(!newRecipient.value||!canTakeTransfer(newRecipient.value,activeAssignment.value))throw Error('Chọn thành viên rảnh và không trùng giờ');await check(await supabase.from('swap_requests').insert({room_id:room.value.id,assignment_id:activeAssignment.value.id,from_user:user.value.id,to_user:newRecipient.value}));modal.value='';await refresh(['swap_requests','room_notifications']);toast('Đã gửi yêu cầu đổi việc')})}
+async function decideSwap(s,accept){await run(async()=>{await check(await supabase.rpc('room_resolve_swap',{p_id:s.id,p_accept:accept}));await refresh(['assignments','swap_requests','room_notifications']);toast(accept?'Đã nhận việc':'Đã từ chối')})}
 function busyPreset(start,end){busyDraft.value={...busyDraft.value,starts_at:start,ends_at:end}}
 function openBusy(){
  busyDraft.value={mode:'weekly',weekday:1,busy_date:selectedDay.value,starts_at:'07:00',ends_at:'12:00',reason:'Đi học'}
@@ -268,13 +307,13 @@ async function saveBusy(){
   if(d.mode==='date'&&!d.busy_date)throw Error('Chọn ngày bận')
   await check(await supabase.from('room_busy_slots').insert(payload))
   modal.value=''
-  await refresh()
+  await refresh(['room_busy_slots'])
   toast('Đã lưu lịch bận; các lần tự phân công sau sẽ tránh giờ này.')
  })
 }
 async function removeBusy(id){
  if(!confirm('Xóa khoảng thời gian bận này?'))return
- await run(async()=>{await check(await supabase.from('room_busy_slots').delete().eq('id',id).eq('user_id',user.value.id));await refresh();toast('Đã xóa lịch bận')})
+ await run(async()=>{await check(await supabase.from('room_busy_slots').delete().eq('id',id).eq('user_id',user.value.id));await refresh(['room_busy_slots']);toast('Đã xóa lịch bận')})
 }
 async function markDebt(){
  if(!activeAssignment.value)return
@@ -282,7 +321,7 @@ async function markDebt(){
  await run(async()=>{
   await check(await supabase.rpc('room_mark_uncovered',{p_assignment:activeAssignment.value.id,p_reason:debtReason.value}))
   modal.value=''
-  await refresh()
+  await refresh(['assignments','room_work_debts','swap_requests','room_notifications'])
   toast('Đã ghi nợ việc. Trưởng nhóm có thể phân ca bù sau.')
  })
 }
@@ -296,83 +335,93 @@ async function scheduleMakeup(){
   if(!d.chore_id||!d.work_date)throw Error('Chọn công việc và ngày bù')
   await check(await supabase.rpc('room_schedule_makeup',{p_debt:d.debt_id,p_chore:d.chore_id,p_date:d.work_date}))
   modal.value=''
-  await refresh()
+  await refresh(['assignments','room_work_debts','room_notifications'])
   toast('Đã lên lịch bù. Nợ chỉ được xóa sau khi hoàn thành việc bù.')
  })
 }
-async function toggleAvailability(day){await run(async()=>{const old=availability.value.find(a=>a.user_id===user.value.id&&a.weekday===day);await check(await supabase.from('member_availability').upsert({room_id:room.value.id,user_id:user.value.id,weekday:day,available:old?.available===false}));await refresh()})}
-async function saveProfile(){await run(async()=>{const value=draftName.value.trim();if(!value||value.length>60)throw Error('Tên phải từ 1 đến 60 ký tự');await check(await supabase.from('room_profiles').update({display_name:value,updated_at:new Date().toISOString()}).eq('user_id',user.value.id));modal.value='';await refresh();toast('Đã cập nhật hồ sơ')})}
-async function readNotifications(){await run(async()=>{await check(await supabase.from('room_notifications').update({read_at:new Date().toISOString()}).eq('user_id',user.value.id).is('read_at',null));await refresh()})}
-// Live synchronization for all shared Roomly data. Coalesce a burst of
-// database changes (e.g. a weekly scheduling transaction) into one fetch.
+async function toggleAvailability(day){await run(async()=>{const old=availability.value.find(a=>a.user_id===user.value.id&&a.weekday===day);await check(await supabase.from('member_availability').upsert({room_id:room.value.id,user_id:user.value.id,weekday:day,available:old?.available===false}));await refresh(['member_availability'])})}
+async function saveProfile(){await run(async()=>{const value=draftName.value.trim();if(!value||value.length>60)throw Error('Tên phải từ 1 đến 60 ký tự');await check(await supabase.from('room_profiles').update({display_name:value,updated_at:new Date().toISOString()}).eq('user_id',user.value.id));modal.value='';await refresh(['room_profiles']);toast('Đã cập nhật hồ sơ')})}
+async function readNotifications(){await run(async()=>{await check(await supabase.from('room_notifications').update({read_at:new Date().toISOString()}).eq('user_id',user.value.id).is('read_at',null));await refresh(['room_notifications'])})}
+// Single room-scoped Realtime connection; topic-specific reads only.
+// Internal navigation changes currentTab and never touches auth or routing.
 const liveState=ref('connecting')
-let channel=null,memberChannel=null,liveTimer=null,liveRequest=0,lastReconnect=0
+let channel=null,memberChannel=null,membershipTimer=null,lastReconnect=0
 function closeChannel(ch){if(ch&&supabase)supabase.removeChannel(ch)}
 async function syncRoomInfo(){
  const id=room.value?.id
  if(!id)return
  try{
-  const result=await supabase.from('rooms').select('*').eq('id',id).maybeSingle()
-  const updated=await check(result)
+  const updated=await check(await supabase.from('rooms').select('*').eq('id',id).maybeSingle())
   if(room.value?.id!==id)return
-  if(updated)room.value={...room.value,...updated}
-  else await loadEverything({silent:true})
- }catch(e){console.warn('Roomly room metadata sync failed',e)}
+  if(updated){
+   if(updated.name!==room.value.name||updated.owner_id!==room.value.owner_id)
+    room.value={...room.value,...updated}
+  }else if(!busy.value){
+   // A room really being deleted warrants checking the user's own membership.
+   await loadEverything({silent:true})
+  }
+ }catch(e){console.warn('Room metadata refresh failed:',localErr(e))}
 }
-function queueLiveRefresh(membership=false){
- if(!user.value)return
- if(membership)liveRequest=1
- if(liveTimer)clearTimeout(liveTimer)
- liveTimer=setTimeout(async()=>{
-  liveTimer=null
-  const shouldReload=Boolean(liveRequest)
-  liveRequest=0
-  try{
-   if(shouldReload)await loadEverything({silent:true})
-   else if(room.value)await refresh()
-  }catch(e){liveState.value='error';console.warn('Roomly realtime synchronization failed',e)}
- },220)
+function queueLiveRefresh(topics=['all']){
+ if(!user.value||!room.value)return Promise.resolve()
+ return syncQueue.request(topics).catch(e=>{
+  console.warn('Roomly realtime slice refresh failed:',localErr(e))
+ })
+}
+function scheduleOwnMembershipCheck(){
+ if(membershipTimer!==null)clearTimeout(membershipTimer)
+ membershipTimer=setTimeout(()=>{
+  membershipTimer=null
+  if(user.value&&!busy.value)void loadEverything({silent:true})
+ },300)
 }
 watch(()=>room.value?.id,id=>{
  closeChannel(channel);channel=null
  if(!id||!supabase){liveState.value='connecting';return}
  liveState.value='connecting'
- const changes=['rooms','room_members','room_profiles','chores','assignments',
-  'member_availability','room_busy_slots','room_work_debts','swap_requests','room_notifications']
- let next=supabase.channel('roomly-all-'+id)
- for(const table of changes){
+ const tables=['rooms',...ROOM_TOPICS]
+ let next=supabase.channel('roomly-data-'+id)
+ for(const table of tables){
   const rule={event:'*',schema:'public',table}
   if(table==='rooms')rule.filter='id=eq.'+id
   else if(table==='room_notifications')rule.filter='user_id=eq.'+user.value.id
   else if(table!=='room_profiles')rule.filter='room_id=eq.'+id
   next=next.on('postgres_changes',rule,()=>{
-   // Other members being removed must never restart this user's workspace.
-   if(table==='rooms')syncRoomInfo()
-   queueLiveRefresh(false)
+   if(table==='rooms'){void syncRoomInfo();return}
+   void queueLiveRefresh(topicsForTable(table))
   })
  }
  channel=next.subscribe(status=>{
-  if(status==='SUBSCRIBED'){liveState.value='connected';queueLiveRefresh(false)}
-  else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED')
+  if(status==='SUBSCRIBED'){
+   const reconnect=liveState.value==='reconnecting'
+   liveState.value='connected'
+   if(reconnect)void queueLiveRefresh(['all'])
+  }else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED')
    liveState.value='reconnecting'
  })
 })
 watch(()=>user.value?.id,id=>{
  closeChannel(memberChannel);memberChannel=null
  if(!id||!supabase)return
- memberChannel=supabase.channel('roomly-membership-'+id)
+ // Only changes to this user's OWN membership can send them to onboarding.
+ // Removing somebody else never runs loadEverything/reset.
+ memberChannel=supabase.channel('roomly-self-membership-'+id)
   .on('postgres_changes',{event:'*',schema:'public',table:'room_members',filter:'user_id=eq.'+id},
-   ()=>queueLiveRefresh(true))
+   scheduleOwnMembershipCheck)
   .subscribe()
 })
 function checkReconnect(){
  if(!user.value||document.visibilityState==='hidden')return
- if(Date.now()-lastReconnect<30000)return
+ if(Date.now()-lastReconnect<60000)return
  lastReconnect=Date.now()
  if(room.value){
-  maybeRolloverDishes(room.value.id).catch(()=>{})
-  queueLiveRefresh(false)
- }else queueLiveRefresh(true)
+  void maybeRolloverDishes(room.value.id).catch(()=>{})
+  // Only reconcile after a long absence or lost socket; never remount a tab.
+  if(liveState.value!=='connected'||Date.now()-lastDataSyncAt>180000)
+   void queueLiveRefresh(['all'])
+ }else if(roomStatus.value!=='loading'){
+  void loadEverything({silent:true})
+ }
 }
 let dayWatcher=null
 let observedDay=localVietnamDay()
@@ -384,7 +433,6 @@ onMounted(()=>{
  window.addEventListener('focus',checkReconnect)
  window.addEventListener('online',checkReconnect)
  document.addEventListener('visibilitychange',checkReconnect)
- // An open browser can cross midnight without a focus/visibility event.
  dayWatcher=setInterval(()=>{
   const day=localVietnamDay()
   if(day!==observedDay){observedDay=day;checkReconnect()}
@@ -394,9 +442,10 @@ onUnmounted(()=>{
  window.removeEventListener('beforeinstallprompt',onInstallAvailable)
  window.removeEventListener('appinstalled',onAppInstalled)
  if(dayWatcher)clearInterval(dayWatcher)
+ if(membershipTimer!==null)clearTimeout(membershipTimer)
+ syncQueue.dispose()
  authSubscription?.unsubscribe()
  closeChannel(channel);closeChannel(memberChannel)
- if(liveTimer)clearTimeout(liveTimer)
  window.removeEventListener('focus',checkReconnect)
  window.removeEventListener('online',checkReconnect)
  document.removeEventListener('visibilitychange',checkReconnect)
