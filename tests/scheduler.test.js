@@ -1,4 +1,4 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {generateWeek,mondayOf,overlap,dateAt,isBusy,isCooking} from '../src/scheduler.js'
+import test from 'node:test';import assert from 'node:assert/strict';import {generateWeek,mondayOf,overlap,dateAt,isBusy,isCooking,isLaundry,choreCategory} from '../src/scheduler.js'
 test('week starts on Monday and dates cross months',()=>{assert.equal(mondayOf('2026-11-15'),'2026-11-09');assert.equal(dateAt('2026-11-30',6),'2026-12-06')})
 test('does not double book overlapping jobs',()=>{const m=[{user_id:'a'},{user_id:'b'}];const c=['lunch','dinner'].map((name,i)=>({id:name,name,room_id:'r',start_time:'10:00',duration_minutes:60,weight:1,weekdays:[1]}));let x=generateWeek({members:m,chores:c,weekStart:'2026-11-09'});assert.equal(x.rows.length,2);assert.notEqual(x.rows[0].assignee_id,x.rows[1].assignee_id);assert.ok(overlap(c[0],c[1]))})
 test('availability restricts assignment',()=>{const x=generateWeek({members:[{user_id:'a'},{user_id:'b'}],chores:[{id:'c',name:'cook',room_id:'r',start_time:'12:00',duration_minutes:60,weight:1,weekdays:[1]}],availability:[{user_id:'a',weekday:1,available:false}],weekStart:'2026-11-09'});assert.equal(x.rows[0].assignee_id,'b')})
@@ -47,4 +47,39 @@ test('busy all members results in warning, never invented assignment',()=>{
  const result=generateWeek({members,chores:[chore],busySlots,weekStart:'2026-11-09'})
  assert.equal(result.rows.length,0)
  assert.equal(result.warnings.length,1)
+})
+
+test('wash and dry are one job category, and each member gets one turn before repeat',()=>{
+ const members=['a','b','c','d'].map(user_id=>({user_id}))
+ const chores=[{id:'laundry',icon:'wash',name:'Giặt và phơi quần áo',room_id:'r',start_time:'08:00',duration_minutes:105,weight:2,weekdays:[1,2,3,4,5,6,7]}]
+ const first=generateWeek({members,chores,weekStart:'2026-11-09'})
+ assert.equal(first.rows.length,7)
+ assert.equal(new Set(first.rows.slice(0,4).map(x=>x.assignee_id)).size,4)
+ const next=generateWeek({members,chores,weekStart:'2026-11-16',history:first.rows})
+ const all=[...first.rows,...next.rows]
+ for(let i=0;i<all.length;i+=4)if(all.length-i>=4)
+  assert.equal(new Set(all.slice(i,i+4).map(x=>x.assignee_id)).size,4)
+ assert.equal(choreCategory({id:'old',icon:'dry',name:'Phơi áo quần'}),'laundry')
+ assert.ok(isLaundry(chores[0]))
+})
+test('strict round holds next turn when the only remaining member is busy',()=>{
+ const members=['a','b','c'].map(user_id=>({user_id}))
+ const chore={id:'l',name:'Nấu ăn trưa',icon:'lunch',room_id:'r',start_time:'11:00',duration_minutes:60,weight:2,weekdays:[1,2,3,4]}
+ const busySlots=[{user_id:'c',busy_date:'2026-11-11',starts_at:'07:00',ends_at:'13:00'}]
+ const generated=generateWeek({members,chores:[chore],busySlots,weekStart:'2026-11-09'})
+ assert.deepEqual(generated.rows.map(a=>a.work_date),['2026-11-09','2026-11-10','2026-11-12'])
+ assert.equal(new Set(generated.rows.map(a=>a.assignee_id)).size,3)
+ assert.equal(generated.warnings.length,1)
+})
+test('each non-cooking category also has its own strict member-size rounds',()=>{
+ const members=['a','b','c'].map(user_id=>({user_id}))
+ const chores=[{id:'water',name:'Đổi nước',icon:'water',room_id:'r',start_time:'18:00',duration_minutes:15,weight:1,weekdays:[1,2,3,4,5,6,7]},
+ {id:'laundry',name:'Giặt và phơi quần áo',icon:'wash',room_id:'r',start_time:'08:00',duration_minutes:100,weight:2,weekdays:[1,2,3,4,5,6,7]}]
+ const x=generateWeek({members,chores,weekStart:'2026-11-09'})
+ for(const id of ['water','laundry']){
+  const rows=x.rows.filter(a=>a.chore_id===id)
+  assert.equal(rows.length,7)
+  assert.equal(new Set(rows.slice(0,3).map(a=>a.assignee_id)).size,3)
+  assert.equal(new Set(rows.slice(3,6).map(a=>a.assignee_id)).size,3)
+ }
 })
