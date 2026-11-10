@@ -1,4 +1,4 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {generateWeek,mondayOf,overlap,dateAt,isBusy,isCooking,isLaundry,choreCategory} from '../src/scheduler.js'
+import test from 'node:test';import assert from 'node:assert/strict';import {generateWeek,mondayOf,overlap,dateAt,isBusy,isCooking,isLaundry,choreCategory,isAnytime} from '../src/scheduler.js'
 test('week starts on Monday and dates cross months',()=>{assert.equal(mondayOf('2026-11-15'),'2026-11-09');assert.equal(dateAt('2026-11-30',6),'2026-12-06')})
 test('does not double book overlapping jobs',()=>{const m=[{user_id:'a'},{user_id:'b'}];const c=['lunch','dinner'].map((name,i)=>({id:name,name,room_id:'r',start_time:'10:00',duration_minutes:60,weight:1,weekdays:[1]}));let x=generateWeek({members:m,chores:c,weekStart:'2026-11-09'});assert.equal(x.rows.length,2);assert.notEqual(x.rows[0].assignee_id,x.rows[1].assignee_id);assert.ok(overlap(c[0],c[1]))})
 test('availability restricts assignment',()=>{const x=generateWeek({members:[{user_id:'a'},{user_id:'b'}],chores:[{id:'c',name:'cook',room_id:'r',start_time:'12:00',duration_minutes:60,weight:1,weekdays:[1]}],availability:[{user_id:'a',weekday:1,available:false}],weekStart:'2026-11-09'});assert.equal(x.rows[0].assignee_id,'b')})
@@ -82,4 +82,29 @@ test('each non-cooking category also has its own strict member-size rounds',()=>
   assert.equal(new Set(rows.slice(0,3).map(a=>a.assignee_id)).size,3)
   assert.equal(new Set(rows.slice(3,6).map(a=>a.assignee_id)).size,3)
  }
+})
+
+test('all-day laundry and cleaning have no artificial 8AM conflict',()=>{
+ const chores=[
+  {id:'laundry',icon:'wash',name:'Giặt và phơi quần áo',room_id:'r',time_mode:'anytime',start_time:'08:00',duration_minutes:105,weekdays:[1],weight:2},
+  {id:'floor',icon:'sparkles',name:'Quét và lau nhà',room_id:'r',time_mode:'anytime',start_time:'08:00',duration_minutes:45,weekdays:[1],weight:1},
+  {id:'lunch',icon:'lunch',name:'Nấu ăn trưa',room_id:'r',time_mode:'timed',start_time:'11:00',duration_minutes:60,weekdays:[1],weight:2}
+ ]
+ const study=[{user_id:'a',weekday:1,starts_at:'07:00',ends_at:'12:00'}]
+ assert.equal(isAnytime(chores[0]),true)
+ assert.equal(isAnytime(chores[1]),true)
+ assert.equal(isAnytime(chores[2]),false)
+ assert.equal(overlap(chores[0],chores[1]),false)
+ assert.equal(overlap(chores[0],chores[2]),false)
+ assert.equal(isBusy({userId:'a',date:'2026-11-09',weekday:1,chore:chores[0],busySlots:study}),false)
+ assert.equal(isBusy({userId:'a',date:'2026-11-09',weekday:1,chore:chores[2],busySlots:study}),true)
+ const result=generateWeek({members:[{user_id:'a'},{user_id:'b'}],chores,busySlots:study,weekStart:'2026-11-09'})
+ assert.equal(result.rows.length,3)
+ assert.equal(result.rows.find(a=>a.chore_id==='lunch').assignee_id,'b')
+})
+test('all-day unavailability prevents assignment of anytime chores',()=>{
+ const chore={id:'floor',name:'Quét nhà',room_id:'r',icon:'sparkles',time_mode:'anytime',start_time:'08:00',duration_minutes:45,weight:1,weekdays:[1]}
+ const busy=[{user_id:'a',weekday:1,starts_at:'00:00',ends_at:'23:59'}]
+ const result=generateWeek({members:[{user_id:'a'},{user_id:'b'}],chores:[chore],busySlots:busy,weekStart:'2026-11-09'})
+ assert.equal(result.rows[0].assignee_id,'b')
 })
