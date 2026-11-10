@@ -43,5 +43,5 @@ test('focus only refreshes background data, no unconditional whole-room reload',
  const body=source.slice(start,end)
  assert.match(body,/queueLiveRefresh\(false\)/)
  assert.match(body,/liveState\.value==='reconnecting'/)
- assert.doesNotMatch(body,/queueLiveRefresh\(true\)\s*\n}/)
+ assert.match(body,/\}else queueLiveRefresh\(true\)/)
 })
